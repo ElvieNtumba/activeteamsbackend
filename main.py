@@ -22,9 +22,11 @@ app.add_middleware(
 
 # Connect to MongoDB
 
-MONGO_URI = os.getenv("MONGO_URI")
-client = AsyncIOMotorClient(MONGO_URI)
-db = client["active-teams-backend"]
+MONGODB_URI = os.getenv("MONGODB_URI")
+client = AsyncIOMotorClient(MONGODB_URI)
+db = client["active-teams-db"]
+users_collection = db["Users"]
+
 
 
 @app.on_event("startup")
