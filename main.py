@@ -2,19 +2,8 @@ import os
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-from motor.motor_asyncio import AsyncIOMotorClient , AsyncIOMotorDatabase
-from typing import List
-from datetime import datetime
-from pydantic import BaseModel, Field
-
-from tasks import (
-    get_tasks,
-    post_task,
-    get_tasks_by_day,
-    get_tasks_last_7_days,
-    get_tasks_this_week,
-    get_tasks_previous_month
-)
+from auth.routes import router as auth_router
+from motor.motor_asyncio import AsyncIOMotorClient
 
 # Load .env variables
 load_dotenv()
@@ -22,49 +11,31 @@ load_dotenv()
 # Initialize FastAPI app
 app = FastAPI()
 
+# CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Connect to MongoDB
 
-MONGO_URI = os.getenv("MONGO_URI")
-client = AsyncIOMotorClient(MONGO_URI)
+MONGODB_URI = os.getenv("MONGODB_URI")
+client = AsyncIOMotorClient(MONGODB_URI)
 db = client["active-teams-db"]
+users_collection = db["Users"]
 
-def get_db():
-    return db
 
-# ----------------- Pydantic Models -----------------
-class ContactedPerson(BaseModel):
-    name: str
-    phone: str
-    notes: str = ""
-
-class TaskCreate(BaseModel):
-    member_id: str = Field(..., alias="memberID")
-    member_name: str = Field(..., alias="name")
-    contacted_person: ContactedPerson
-    followup_date: datetime
-    status: str = "Pending"
-
-# ----------------- API Endpoints -----------------
-
-@app.get("/tasks", summary="Get all Calling/Visiting/Pending tasks")
-async def fetch_tasks(db: AsyncIOMotorDatabase = Depends(get_db)):
-    return await get_tasks(db)
-
-@app.post("/tasks", summary="Create a new task")
-async def create_task(task: TaskCreate, db: AsyncIOMotorDatabase = Depends(get_db)):
-    task_id = await post_task(
-        db,
-        task.member_id,
-        task.member_name,
-        task.contacted_person.dict(),
-        task.followup_date,
-        task.status
-    )
-    return {"inserted_id": task_id}
 
 @app.on_event("startup")
 async def startup_event():
     app.mongodb = db
+
+# Include auth routes
+app.include_router(auth_router)
+
 
 # Routes
 
