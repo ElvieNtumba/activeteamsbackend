@@ -14,7 +14,18 @@ async def signup(user: UserCreate):
         raise HTTPException(status_code=400, detail="Email already registered")
     
     hashed = hash_password(user.password)
-    user_dict = {"email": user.email, "password": hashed}
+    user_dict = {
+        "name": user.name,
+        "surname": user.surname,
+        "date_of_birth": user.date_of_birth,
+        "home_address": user.home_address,
+        "invited_by": user.invited_by,
+        "phone_number": user.phone_number,
+        "email": user.email,
+        "gender": user.gender,
+        "password": hashed,
+        "confirm_password": hashed
+    }
     await db["Users"].insert_one(user_dict)
     return {"message": "User created successfully"}
 
