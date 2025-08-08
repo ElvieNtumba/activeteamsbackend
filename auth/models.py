@@ -1,5 +1,7 @@
 from pydantic import BaseModel, EmailStr
+from typing import Optional
 
+# User creation model with role
 class UserCreate(BaseModel):
     name: str
     surname: str
@@ -10,7 +12,8 @@ class UserCreate(BaseModel):
     email: EmailStr
     gender: str
     password: str
-    
+    role: Optional[str] = None  # Optional role; default to 'user' in signup logic
+
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
@@ -30,3 +33,12 @@ class CheckIn(BaseModel):
 class UncaptureRequest(BaseModel):
     event_id: str
     name: str
+
+# Authentication models
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    sub: Optional[str] = None
+    role: Optional[str] = None
