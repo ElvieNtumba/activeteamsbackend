@@ -10,7 +10,6 @@ from auth.utils import hash_password, verify_password
 
 # Load .env variables
 load_dotenv()
-
 # FastAPI app
 app = FastAPI()
 
@@ -77,6 +76,100 @@ async def create_event(event: Event):
         return {"message": "Event created", "id": str(result.inserted_id)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# EVENTS-----------------------
+
+
+# Postman test-- POST http://localhost:8000/events/Encounter
+        #  GET http://localhost:8000/events/Encounter
+        # PUT http://localhost:8000/events/use id 
+        # DELETE http://localhost:8000/events/ use id
+
+
+@app.post("/events/{event_type}")
+async def create_event(event_type: str, event: Event):
+    try:
+        event_data = event.dict()
+
+        # Add event type from URL
+        event_data["eventType"] = event_type
+
+        # Convert date from string to datetime if possible
+        if "date" in event_data and isinstance(event_data["date"], str):
+            event_data["date"] = datetime.fromisoformat(event_data["date"])
+
+        # Ensure attendees list exists
+        if "attendees" not in event_data:
+            event_data["attendees"] = []
+
+        # Insert into MongoDB
+        result = await events_collection.insert_one(event_data)
+
+        return {
+            "message": f"{event_type} event created successfully",
+            "event_type": event_type,
+            "id": str(result.inserted_id)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Get all events
+@app.get("/events")
+async def get_all_events():
+    try:
+        events = []
+        cursor = events_collection.find()
+        async for event in cursor:
+            event["_id"] = str(event["_id"])
+            events.append(event)
+        return {"events": events}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Get events by type
+@app.get("/events/{event_type}")
+async def get_events_by_type(event_type: str):
+    try:
+        events = []
+        cursor = events_collection.find({"eventType": event_type})
+        async for event in cursor:
+            event["_id"] = str(event["_id"])
+            events.append(event)
+        return {"events": events}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Update event
+@app.put("/events/{event_id}")
+async def update_event(event_id: str, event: Event):
+    try:
+        update_data = event.dict()
+        if "date" in update_data and isinstance(update_data["date"], str):
+            update_data["date"] = datetime.fromisoformat(update_data["date"])
+        result = await events_collection.update_one(
+            {"_id": ObjectId(event_id)},
+            {"$set": update_data}
+        )
+        if result.modified_count == 0:
+            raise HTTPException(status_code=404, detail="Event not found or no changes made")
+        return {"message": "Event updated successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Delete event
+@app.delete("/events/{event_id}")
+async def delete_event(event_id: str):
+    try:
+        result = await events_collection.delete_one({"_id": ObjectId(event_id)})
+        if result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Event not found")
+        return {"message": "Event deleted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 # Search People

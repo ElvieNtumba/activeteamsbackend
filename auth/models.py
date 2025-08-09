@@ -1,4 +1,5 @@
 from pydantic import BaseModel, EmailStr
+from typing import List, Dict
 
 class UserCreate(BaseModel):
     name: str
@@ -20,8 +21,8 @@ class Event(BaseModel):
     service_name: str
     date: str 
     location: str
+    place: str 
     total_attendance: int = 0
-    attendees: list[dict] = []
 
 class CheckIn(BaseModel):
     event_id: str
