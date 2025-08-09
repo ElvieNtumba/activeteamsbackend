@@ -10,7 +10,6 @@ from auth.utils import hash_password, verify_password
 
 # Load .env variables
 load_dotenv()
-
 # FastAPI app
 app = FastAPI()
 
@@ -77,6 +76,36 @@ async def create_event(event: Event):
         return {"message": "Event created", "id": str(result.inserted_id)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/events/{event_type}")
+async def create_event(event_type: str, event: Event):
+    try:
+        event_data = event.dict()
+
+        # Add event type from URL
+        event_data["eventType"] = event_type
+
+        # Convert date from string to datetime if possible
+        if "date" in event_data and isinstance(event_data["date"], str):
+            event_data["date"] = datetime.fromisoformat(event_data["date"])
+
+        # Ensure attendees list exists
+        if "attendees" not in event_data:
+            event_data["attendees"] = []
+
+        # Insert into MongoDB
+        result = await events_collection.insert_one(event_data)
+
+        return {
+            "message": f"{event_type} event created successfully",
+            "event_type": event_type,
+            "id": str(result.inserted_id)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 
 # Search People
