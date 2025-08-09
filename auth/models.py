@@ -1,5 +1,6 @@
 from pydantic import BaseModel, EmailStr
-from typing import Optional
+from typing import Optional, Literal, List
+from datetime import datetime
 
 # User creation model with role
 class UserCreate(BaseModel):
@@ -42,3 +43,24 @@ class TokenResponse(BaseModel):
 class TokenData(BaseModel):
     sub: Optional[str] = None
     role: Optional[str] = None
+
+class CellEventCreate(BaseModel):
+    # minimal required fields to create a cell event
+    service_name: str
+    leader_id: str  # user_id of leader (as string)
+    start_date: datetime  # first occurrence date/time (ISO string)
+    start_time: Optional[str] = None  # "18:00" optional separate time
+    recurring: bool = False
+    recurring_day: Optional[Literal[
+        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"
+    ]] = None
+    # optional initial members
+    members: Optional[List[str]] = []
+
+
+class AddMembersRequest(BaseModel):
+    member_ids: List[str]
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token_id: str
+    refresh_token: str
