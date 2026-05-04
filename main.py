@@ -8502,6 +8502,7 @@ async def get_all_people_for_event(
         
         cursor = people_collection.aggregate(pipeline)
         people_list = []
+        
         async for person in cursor:
             people_list.append(person)
         
