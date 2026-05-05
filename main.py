@@ -10467,22 +10467,22 @@ async def update_user_role(
                 "supreme_admin": 6
             }
             
-            if not is_supreme:
-                current_user_role_level = ROLE_HIERARCHY.get(current_user.get("role"), 0)
-                target_user_level = ROLE_HIERARCHY.get(old_role, 0)
-                new_role_level = ROLE_HIERARCHY.get(new_role, 0)
+            # if not is_supreme:
+            #     current_user_role_level = ROLE_HIERARCHY.get(current_user.get("role"), 0)
+            #     target_user_level = ROLE_HIERARCHY.get(old_role, 0)
+            #     new_role_level = ROLE_HIERARCHY.get(new_role, 0)
                 
-                if target_user_level >= current_user_role_level:
-                    raise HTTPException(
-                        status_code=403,
-                        detail="Cannot modify users with equal or higher role"
-                    )
+            #     if target_user_level >= current_user_role_level:
+            #         raise HTTPException(
+            #             status_code=403,
+            #             detail="Cannot modify users with equal or higher role"
+            #         )
                 
-                if new_role_level >= current_user_role_level:
-                    raise HTTPException(
-                        status_code=403,
-                        detail="Cannot assign role equal to or higher than your own"
-                    )
+            #     if new_role_level >= current_user_role_level:
+            #         raise HTTPException(
+            #             status_code=403,
+            #             detail="Cannot assign role equal to or higher than your own"
+            #         )
         else:
             if new_role == "admin" and not is_supreme:
                 raise HTTPException(
@@ -10490,22 +10490,22 @@ async def update_user_role(
                     detail="Cannot assign admin role"
                 )
             
-            if new_role in system_roles and not is_supreme:
-                ROLE_HIERARCHY = {
-                    "registrant": 2,
-                    "user": 1,
-                    "leader": 3,
-                    "leaderAt12": 4,
-                    "admin": 5
-                }
+            # if new_role in system_roles and not is_supreme:
+            #     ROLE_HIERARCHY = {
+            #         "registrant": 2,
+            #         "user": 1,
+            #         "leader": 3,
+            #         "leaderAt12": 4,
+            #         "admin": 5
+            #     }
                 current_user_role_level = ROLE_HIERARCHY.get(current_user.get("role"), 0)
                 new_role_level = ROLE_HIERARCHY.get(new_role, 0)
                 
-                if new_role_level >= current_user_role_level:
-                    raise HTTPException(
-                        status_code=403,
-                        detail="Cannot assign system role equal to or higher than your own"
-                    )
+                # if new_role_level >= current_user_role_level:
+                #     raise HTTPException(
+                #         status_code=403,
+                #         detail="Cannot assign system role equal to or higher than your own"
+                #     )
         
         result = await users_collection.update_one(
             {"_id": ObjectId(user_id)},
