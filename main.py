@@ -9528,15 +9528,146 @@ async def create_task(task: TaskModel, current_user: dict = Depends(get_current_
 
 # ====================== GET /tasks ======================
 
+@app.get("/tasks/my-special-tasks")
+async def get_my_special_tasks(
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Returns all consolidation and service follow-up tasks
+    for the current user, regardless of date.
+    Matches by assignedfor, assigned_to_email, or leader fields.
+    """
+    try:
+        org_name = None
+        for key in current_user.keys():
+            if key.lower() == "organization":
+                org_name = current_user[key]
+                break
+
+        if not org_name:
+            raise HTTPException(status_code=403, detail="No organization found")
+
+        user_email = current_user.get("email", "").strip().lower()
+        user_name = f"{current_user.get('name', '')} {current_user.get('surname', '')}".strip()
+        timezone = pytz.timezone("Africa/Johannesburg")
+
+        email_regex = {"$regex": f"^{re.escape(user_email)}$", "$options": "i"}
+
+        query = {
+            "Organization": org_name,
+            "$or": [
+                # Must be a consolidation or service follow-up type
+                {"taskType": {"$regex": "^consolidation$", "$options": "i"}},
+                {"taskType": {"$regex": "^service follow up$", "$options": "i"}},
+                {"is_consolidation_task": True},
+                {"is_new_person_task": True},
+            ],
+            # AND must be assigned to this user
+            "$and": [
+                {
+                    "$or": [
+                        {"assignedfor": email_regex},
+                        {"assigned_to_email": email_regex},
+                        {"leader_name": user_name},
+                        {"leader_assigned": user_name},
+                    ]
+                }
+            ]
+        }
+
+        cursor = tasks_collection.find(query).sort("followup_date", -1).limit(200)
+        all_tasks = []
+
+        async for task in cursor:
+            task_date_raw = task.get("followup_date")
+            task_datetime = None
+
+            if task_date_raw:
+                try:
+                    if isinstance(task_date_raw, datetime):
+                        task_datetime = task_date_raw.astimezone(timezone)
+                    elif isinstance(task_date_raw, str):
+                        task_datetime = datetime.fromisoformat(
+                            task_date_raw.replace("Z", "+00:00")
+                        ).astimezone(timezone)
+                    elif isinstance(task_date_raw, dict) and "$date" in task_date_raw:
+                        task_datetime = datetime.fromisoformat(
+                            str(task_date_raw["$date"]).replace("Z", "+00:00")
+                        ).astimezone(timezone)
+                except (ValueError, TypeError, AttributeError) as e:
+                    logging.warning(f"Could not parse followup_date '{task_date_raw}': {e}")
+                    task_datetime = None
+
+            task_type_raw = task.get("taskType", "")
+            task_type_lower = task_type_raw.lower()
+
+            is_consolidation = (
+                bool(task.get("is_consolidation_task")) or
+                task_type_lower == "consolidation"
+            )
+            is_new_person = (
+                bool(task.get("is_new_person_task")) or
+                task_type_lower in ("service follow up", "new_person", "new person")
+            )
+
+            completed_at = task.get("completedAt")
+            created_at = task.get("createdAt") or task.get("created_at")
+
+            def fmt_date(d):
+                if isinstance(d, datetime):
+                    return d.isoformat()
+                if isinstance(d, str):
+                    return d
+                return ""
+
+            all_tasks.append({
+                "_id": str(task["_id"]),
+                "name": task.get("name", ""),
+                "taskType": task_type_raw,
+                "followup_date": task_datetime.isoformat() if task_datetime else None,
+                "status": task.get("status", "Open"),
+                "assignedfor": task.get("assignedfor", ""),
+                "assigned_to_email": task.get("assigned_to_email", ""),
+                "created_by_email": task.get("created_by_email", ""),
+                "created_by_name": task.get("created_by_name", ""),
+                "leader_name": task.get("leader_name", ""),
+                "leader_assigned": task.get("leader_assigned", ""),
+                "type": task.get("type", "consolidation"),
+                "contacted_person": task.get("contacted_person", {}),
+                "isRecurring": bool(task.get("recurring_day")),
+                "is_consolidation_task": is_consolidation,
+                "is_new_person_task": is_new_person,
+                "source_display": task.get("source_display", "Manual"),
+                "consolidation_source": task.get("consolidation_source", "manual"),
+                "decision_date": task.get("decision_date", ""),
+                "decision_display_name": task.get("decision_display_name", ""),
+                "person_name": task.get("person_name", ""),
+                "person_surname": task.get("person_surname", ""),
+                "completedAt": fmt_date(completed_at),
+                "createdAt": fmt_date(created_at),
+                "created_at": task.get("created_at", ""),
+            })
+
+        return {
+            "tasks": all_tasks,
+            "total": len(all_tasks),
+            "status": "success"
+        }
+
+    except Exception as e:
+        logging.error(f"Error in get_my_special_tasks: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/tasks")
 async def get_user_tasks(
     email: str = Query(None),
+    assigned_to_email: str = Query(None),   # add this param
+    assignedfor: str = Query(None),          # add this param
     userId: str = Query(None),
     view_all: bool = Query(False),
     current_user: dict = Depends(get_current_user)
 ):
     try:
-        # === ROBUST ORGANIZATION LOOKUP (ignores case - same as POST) ===
         org_name = None
         for key in current_user.keys():
             if key.lower() == "organization":
@@ -9548,31 +9679,39 @@ async def get_user_tasks(
 
         is_super_admin = current_user.get("role") == "super_admin"
         is_leader = current_user.get("role") in ["admin", "leader", "manager", "org_admin"]
+
+        # Resolve user_email from whichever query param was provided
         if email:
-            user_email = email.lower()
+            user_email = email.strip().lower()
+        elif assigned_to_email:
+            user_email = assigned_to_email.strip().lower()
+        elif assignedfor:
+            user_email = assignedfor.strip().lower()
         elif userId:
             user = await users_collection.find_one({"_id": ObjectId(userId)})
-            if user:
-                user_email = user.get("email", "").lower()
+            user_email = user.get("email", "").lower() if user else ""
         else:
             user_email = current_user.get("email", "").lower()
 
         if not user_email and not (is_leader and view_all):
             return {"error": "User email not found", "status": "failed"}
-        
-        # Build leader full name (kept from your original)
+
         user_name = f"{current_user.get('name', '')} {current_user.get('surname', '')}".strip()
         timezone = pytz.timezone("Africa/Johannesburg")
 
         if is_super_admin and view_all:
-            query = {}                                     
+            query = {}
         elif is_leader and view_all:
-            query = {"Organization": org_name}       
+            query = {"Organization": org_name}
         else:
+            # Case-insensitive email match using regex
+            email_regex = {"$regex": f"^{re.escape(user_email)}$", "$options": "i"}
             query = {
+                "Organization": org_name,   # always scope to org
                 "$or": [
-                    {"assignedfor": user_email},
-                    {"assigned_to_email": user_email},
+                    {"assignedfor": email_regex},
+                    {"assigned_to_email": email_regex},
+                    {"created_by_email": email_regex},   # catches tasks user created
                     {
                         "$and": [
                             {"leader_name": user_name},
@@ -9592,39 +9731,65 @@ async def get_user_tasks(
         all_tasks = []
 
         async for task in cursor:
-            task_date_str = task.get("followup_date")
+            task_date_raw = task.get("followup_date")
             task_datetime = None
-            if task_date_str:
-                if isinstance(task_date_str, datetime):
-                    task_datetime = task_date_str.astimezone(timezone)
-                else:
-                    try:
+
+            if task_date_raw:
+                try:
+                    if isinstance(task_date_raw, datetime):
+                        # MongoDB native datetime (the $date object case)
+                        task_datetime = task_date_raw.astimezone(timezone)
+                    elif isinstance(task_date_raw, str):
+                        # Plain ISO string — your new tasks store it this way
                         task_datetime = datetime.fromisoformat(
-                            str(task_date_str).replace("Z", "+00:00")
+                            task_date_raw.replace("Z", "+00:00")
                         ).astimezone(timezone)
-                    except ValueError:
-                        logging.warning(f"Invalid date format: {task_date_str}")
-                        continue
+                    elif isinstance(task_date_raw, dict) and "$date" in task_date_raw:
+                        # Fallback: raw extended JSON dict (shouldn't happen via motor but safe)
+                        task_datetime = datetime.fromisoformat(
+                            str(task_date_raw["$date"]).replace("Z", "+00:00")
+                        ).astimezone(timezone)
+                except (ValueError, TypeError, AttributeError) as e:
+                    logging.warning(f"Could not parse followup_date '{task_date_raw}': {e}")
+                    # Don't skip — still include the task, just without a parsed date
+                    task_datetime = None
+
+            # Resolve task type display — normalise casing
+            task_type_raw = task.get("taskType", "")
+            task_type_lower = task_type_raw.lower()
+
+            # Detect special task types regardless of casing
+            is_consolidation = bool(task.get("is_consolidation_task")) or task_type_lower == "consolidation"
+            is_new_person = (
+                task_type_lower in ("service follow up", "new_person", "new person")
+                or bool(task.get("is_new_person_task"))
+            )
 
             all_tasks.append({
                 "_id": str(task["_id"]),
                 "name": task.get("name", "Unnamed Task"),
-                "taskType": task.get("taskType", ""),
+                "taskType": task_type_raw,
                 "followup_date": task_datetime.isoformat() if task_datetime else None,
                 "status": task.get("status", "Open"),
                 "assignedfor": task.get("assignedfor", ""),
                 "assigned_to_email": task.get("assigned_to_email", ""),
                 "created_by_email": task.get("created_by_email", ""),
+                "created_by_name": task.get("created_by_name", ""),
                 "leader_name": task.get("leader_name", ""),
+                "leader_assigned": task.get("leader_assigned", ""),   # was missing
                 "type": task.get("type", "call"),
                 "contacted_person": task.get("contacted_person", {}),
                 "isRecurring": bool(task.get("recurring_day")),
-                "is_consolidation_task": bool(task.get("is_consolidation_task")),
+                "is_consolidation_task": is_consolidation,
+                "is_new_person_task": is_new_person,              # was missing
                 "consolidation_source": task.get("consolidation_source", "manual"),
-                "source_display": task.get("source_display", "Manual")
+                "source_display": task.get("source_display", "Manual"),
+                # Include raw dates as fallbacks for the frontend
+                "createdAt": task.get("createdAt").isoformat() if isinstance(task.get("createdAt"), datetime) else str(task.get("createdAt", "")),
+                "completedAt": task.get("completedAt").isoformat() if isinstance(task.get("completedAt"), datetime) else str(task.get("completedAt", "")),
+                "decision_date": task.get("decision_date", ""),
             })
 
-        # Sort newest first
         all_tasks.sort(key=lambda t: t["followup_date"] or "", reverse=True)
 
         return {
@@ -9637,7 +9802,7 @@ async def get_user_tasks(
         }
 
     except Exception as e:
-        logging.error(f"Error in get_user_tasks: {e}")
+        logging.error(f"Error in get_user_tasks: {e}", exc_info=True)
         return {"error": str(e), "status": "failed"}
 
 # ====================== GET /tasktypes (NOW FETCHES BY ORGANIZATION) ======================
