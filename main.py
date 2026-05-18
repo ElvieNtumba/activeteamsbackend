@@ -11584,6 +11584,8 @@ async def create_consolidation(
             "success": True
         }
 
+
+
     except Exception as e:
         print(f"Error creating consolidation: {str(e)}")
         import traceback
