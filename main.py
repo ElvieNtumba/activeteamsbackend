@@ -9559,6 +9559,7 @@ async def get_my_special_tasks(
                 # Must be a consolidation or service follow-up type
                 {"taskType": {"$regex": "^consolidation$", "$options": "i"}},
                 {"taskType": {"$regex": "^service follow up$", "$options": "i"}},
+                {"taskType": {"$regex": "^cell consolidation$", "$options": "i"}},
                 {"is_consolidation_task": True},
                 {"is_new_person_task": True},
             ],
@@ -9603,7 +9604,7 @@ async def get_my_special_tasks(
 
             is_consolidation = (
                 bool(task.get("is_consolidation_task")) or
-                task_type_lower == "consolidation"
+                task_type_lower in ("consolidation", "cell consolidation")
             )
             is_new_person = (
                 bool(task.get("is_new_person_task")) or
@@ -11406,7 +11407,6 @@ async def create_consolidation(
                     ]}}
                 ]
             })
-            # After the leader lookup attempt, add:
             print(f"Leader lookup for '{consolidation.assigned_to}': found={leader_person is not None}, email={leader_email}")
             if leader_person:
                 leader_email = leader_person.get("Email")
@@ -11427,6 +11427,8 @@ async def create_consolidation(
                     print(f"Found leader email from users: {leader_email}")
 
         if leader_email:
+            # Plan Change / Normalization: Lowercase email to ensure accurate database lookup
+            leader_email = leader_email.strip().lower()
             leader_user = await users_collection.find_one({"email": leader_email})
             if leader_user:
                 leader_user_id = str(leader_user["_id"])
@@ -11438,7 +11440,17 @@ async def create_consolidation(
 
         decision_display_name = "First Time Decision" if consolidation.decision_type == DecisionType.FIRST_TIME else "Recommitment"
         consolidation_source = getattr(consolidation, 'source', 'manual')
-        source_display = "Service" if consolidation_source == "service_consolidation" else "Event" if consolidation_source == "event_consolidation" else "Manual"
+        
+        # XMind Requirement: Map source to display name
+        if consolidation_source == "service_consolidation":
+            source_display = "Service"
+        elif consolidation_source == "event_consolidation":
+            source_display = "Event"
+        elif consolidation_source == "cell_consolidation":
+            source_display = "Cell"
+        else:
+            source_display = "Manual"
+            
         assigned_for = leader_email if leader_email else consolidation.assigned_to
        
         # 3. Create task
@@ -11584,13 +11596,11 @@ async def create_consolidation(
             "success": True
         }
 
-
-
     except Exception as e:
         print(f"Error creating consolidation: {str(e)}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error creating consolidation: {str(e)}")   
+        raise HTTPException(status_code=500, detail=f"Error creating consolidation: {str(e)}")
     
 @app.get("/api/users")
 async def get_all_users():
