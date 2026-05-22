@@ -489,6 +489,46 @@ def transform_person_full(p, id_to_full: dict = None):
         # sort root first
         leaders.sort(key=lambda x: x["level"])
 
+    leader_flat = {
+        "Leader @1": "",
+        "leader1": "",
+        "Leader at 1": "",
+        "Leader @12": "",
+        "leader12": "",
+        "Leader at 12": "",
+        "Leader @144": "",
+        "leader144": "",
+        "Leader at 144": "",
+        "Leader @1728": "",
+        "leader1728": "",
+        "Leader at 1728": "",
+    }
+
+    for leader in leaders:
+        level = leader.get("level")
+        name = leader.get("name", "")
+        if not name:
+            continue
+        if level == 1:
+            leader_flat["Leader @1"] = leader_flat["Leader @1"] or name
+            leader_flat["leader1"] = leader_flat["leader1"] or name
+            leader_flat["Leader at 1"] = leader_flat["Leader at 1"] or name
+        elif level == 12:
+            leader_flat["Leader @12"] = leader_flat["Leader @12"] or name
+            leader_flat["leader12"] = leader_flat["leader12"] or name
+            leader_flat["Leader at 12"] = leader_flat["Leader at 12"] or name
+        elif level == 144:
+            leader_flat["Leader @144"] = leader_flat["Leader @144"] or name
+            leader_flat["leader144"] = leader_flat["leader144"] or name
+            leader_flat["Leader at 144"] = leader_flat["Leader at 144"] or name
+        elif level == 1728:
+            leader_flat["Leader @1728"] = leader_flat["Leader @1728"] or name
+            leader_flat["leader1728"] = leader_flat["leader1728"] or name
+            leader_flat["Leader at 1728"] = leader_flat["Leader at 1728"] or name
+
+    for key in leader_flat:
+        leader_flat[key] = p.get(key, leader_flat[key]) or leader_flat[key]
+
     result = {
         "_id":          oid(p.get("_id")),
         "Name":         p.get("Name") or "",
@@ -512,7 +552,7 @@ def transform_person_full(p, id_to_full: dict = None):
     return convert_objectids(result)
     
 
-async def invalidate_people_cache(operation_type: str,background_tasks: BackgroundTasks, details: dict = None):
+async def invalidate_people_cache(operation_type: str,details: dict = None):
     """
     Invalidate the people cache and trigger background rehydration.
     Operation types: 'create', 'update', 'delete'
@@ -534,7 +574,7 @@ async def invalidate_people_cache(operation_type: str,background_tasks: Backgrou
         
         if not people_cache["is_loading"]:
             print(f"Triggering background cache refresh after {operation_type} operation...")
-            people_cache["background_task"] = background_tasks.create_task(
+            people_cache["background_task"] = asyncio.create_task(
                 background_refresh_people_cache(stale_data)
             )
         
@@ -855,8 +895,7 @@ async def refresh_people_cache(background_tasks: BackgroundTasks):
     try:
         if not people_cache["is_loading"]:
             print("Manual cache refresh triggered")
-            current_data = people_cache["data"].copy() if people_cache["data"] else None
-            # ← FIXED: was background_tasks.create_task(...) which doesn't exist
+            current_data = people_cache["data"].copy() if people_cache["data"] else Nones
             background_tasks.add_task(background_refresh_people_cache, current_data)
  
             return {
@@ -7925,6 +7964,110 @@ async def uncapture_person(data: UncaptureRequest):
 async def get_profile(user_id: str, current_user: dict = Depends(get_current_user)):
     try:
         token_user_id = current_user.get("user_id") or current_user.get("_id")
+        if not token_user_id:
+            raise HTTPException(status_code=401, detail="Invalid user ID in token")
+        if str(token_user_id) != str(user_id):
+            raise HTTPException(status_code=403, detail="Not authorized to access this profile")
+        if not ObjectId.is_valid(user_id):
+            raise HTTPException(status_code=400, detail=f"Invalid user ID format: {user_id}")
+
+        user = await users_collection.find_one({"_id": ObjectId(user_id)})
+        if not user:
+            raise HTTPException(status_code=404, detail=f"User not found with ID: {user_id}")
+
+        user_email = user.get("email", "")
+
+        # ── Always look up the people doc — it has the authoritative LeaderPath ──
+        person = None
+        if user_email:
+            person = await people_collection.find_one(
+                {"Email": {"$regex": f"^{re.escape(user_email)}$", "$options": "i"}}
+            )
+
+        # ── Resolve leader path: prefer people doc, fall back to users doc ──────
+        raw_path = []
+        if person and person.get("LeaderPath"):
+            raw_path = person["LeaderPath"]
+        elif user.get("LeaderPath"):
+            raw_path = user["LeaderPath"]
+
+        # Normalise to ObjectId list
+        leader_path_oids = []
+        for entry in raw_path:
+            try:
+                leader_path_oids.append(
+                    entry if isinstance(entry, ObjectId) else ObjectId(str(entry))
+                )
+            except Exception:
+                pass
+
+        # ── Resolve the three leader levels from LeaderPath ─────────────────────
+        # LeaderPath is root-first: [root(level1), level12, level144, ...]
+        async def _resolve_leader(oid: ObjectId) -> Optional[dict]:
+            if not oid:
+                return None
+            doc = await people_collection.find_one(
+                {"_id": oid},
+                {"_id": 1, "Name": 1, "Surname": 1, "Email": 1, "Number": 1}
+            )
+            if not doc:
+                return None
+            return {
+                "id": str(doc["_id"]),
+                "name": doc.get("Name", ""),
+                "surname": doc.get("Surname", ""),
+                "email": doc.get("Email", ""),
+                "phone_number": doc.get("Number", "")
+            }
+
+        leader_at_1   = await _resolve_leader(leader_path_oids[0]) if len(leader_path_oids) > 0 else None
+        leader_at_12  = await _resolve_leader(leader_path_oids[1]) if len(leader_path_oids) > 1 else None
+        leader_at_144 = await _resolve_leader(leader_path_oids[2]) if len(leader_path_oids) > 2 else None
+
+        # ── Resolve InvitedBy display name ──────────────────────────────────────
+        # Use people doc's InvitedBy string, or derive from the direct leader
+        invited_by = ""
+        if person:
+            invited_by = person.get("InvitedBy", "") or user.get("invited_by", "")
+        else:
+            invited_by = user.get("invited_by", "")
+
+        # If invited_by is still empty but we have a direct leader, use their name
+        if not invited_by and leader_at_1:
+            invited_by = f"{leader_at_1['name']} {leader_at_1['surname']}".strip()
+
+        organization = user.get("Organization") or user.get("organization", "")
+        leader_path_strs = [str(o) for o in leader_path_oids]
+
+        return {
+            "id": str(user["_id"]),
+            "name": user.get("name", ""),
+            "surname": user.get("surname", ""),
+            "date_of_birth": user.get("date_of_birth", ""),
+            "home_address": user.get("home_address", ""),
+            "invited_by": invited_by,
+            "phone_number": user.get("phone_number", ""),
+            "email": user.get("email", ""),
+            "gender": user.get("gender", ""),
+            "role": user.get("role", "user"),
+            "profile_picture": user.get("profile_picture", ""),
+            "organization": organization,
+            "leader_path": leader_path_strs,
+            "leaders": {
+                "leaderAt1":   leader_at_1,
+                "leaderAt12":  leader_at_12,
+                "leaderAt144": leader_at_144,
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Profile fetch error: {str(e)}")
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to fetch profile: {str(e)}")
+    try:
+        token_user_id = current_user.get("user_id") or current_user.get("_id")
         
         if not token_user_id:
             raise HTTPException(status_code=401, detail="Invalid user ID in token")
@@ -8130,6 +8273,43 @@ def format_user_response(user):
         "organization": user.get("organization", ""),
     }
 
+@app.get("/users")
+async def get_users_by_organization(
+    organization: Optional[str] = Query(None),
+):
+    """Get users filtered by organization - used by signup Invited By dropdown"""
+    try:
+        query = {}
+        if organization:
+            query["$or"] = [
+                {"Organization": {"$regex": f"^{re.escape(organization)}$", "$options": "i"}},
+                {"organization": {"$regex": f"^{re.escape(organization)}$", "$options": "i"}},
+            ]
+        
+        cursor = users_collection.find(
+            query,
+            {"_id": 1, "name": 1, "surname": 1, "email": 1}
+        ).limit(200)
+        
+        users = await cursor.to_list(length=200)
+        
+        formatted = []
+        for user in users:
+            full_name = f"{user.get('name', '')} {user.get('surname', '')}".strip()
+            if full_name:
+                formatted.append({
+                    "_id": str(user["_id"]),
+                    "name": user.get("name", ""),
+                    "surname": user.get("surname", ""),
+                    "email": user.get("email", ""),
+                    "label": full_name,
+                })
+        
+        return {"users": formatted, "total": len(formatted)}
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching users: {str(e)}")    
+
 @app.post("/users/{user_id}/avatar")
 async def upload_avatar(
     user_id: str,
@@ -8280,12 +8460,44 @@ async def get_people(
         # Build search filters
         if name:
             name_parts = name.strip().split()
-            name_conditions = []
-            for part in name_parts:
-                name_conditions.append({"Name": {"$regex": re.escape(part), "$options": "i"}})
-                name_conditions.append({"Surname": {"$regex": re.escape(part), "$options": "i"}})
+            full_query = name.strip()
             query["$and"] = query.get("$and", [])
-            query["$and"].append({"$or": name_conditions})
+            if len(name_parts) >= 2:
+                # Multi-word: match if all parts are in Name or all in Surname, or split between Name/Surname, or full query matches either field
+                part_regexes = [
+                    {"Name": {"$regex": re.escape(part), "$options": "i"}} for part in name_parts
+                ]
+                surname_regexes = [
+                    {"Surname": {"$regex": re.escape(part), "$options": "i"}} for part in name_parts
+                ]
+                query["$and"].append({
+                    "$or": [
+                        # All parts in Name
+                        {"$and": part_regexes},
+                        # All parts in Surname
+                        {"$and": surname_regexes},
+                        # Each part split between Name and Surname (order-insensitive, pairwise)
+                        *[
+                            {"$and": [
+                                {"Name": {"$regex": re.escape(part1), "$options": "i"}},
+                                {"Surname": {"$regex": re.escape(part2), "$options": "i"}}
+                            ]}
+                            for i, part1 in enumerate(name_parts) for j, part2 in enumerate(name_parts) if i != j
+                        ],
+                        # Full query in Name or Surname
+                        {"Name": {"$regex": re.escape(full_query), "$options": "i"}},
+                        {"Surname": {"$regex": re.escape(full_query), "$options": "i"}}
+                    ]
+                })
+            else:
+                # Single part: match either Name or Surname
+                part = name_parts[0]
+                query["$and"].append({
+                    "$or": [
+                        {"Name": {"$regex": re.escape(part), "$options": "i"}},
+                        {"Surname": {"$regex": re.escape(part), "$options": "i"}}
+                    ]
+                })
 
         if gender:
             query["Gender"] = {"$regex": re.escape(gender), "$options": "i"}
@@ -8358,10 +8570,199 @@ async def get_people(
                             all_leader_ids.add(ObjectId(str(lid)))
                     except Exception:
                         pass
-        
+
         name_map = {}
         if all_leader_ids:
             # Only fetch the leaders we need, with a timeout
+            try:
+                leader_cursor = people_collection.find(
+                    {"_id": {"$in": list(all_leader_ids)}},
+                    {"_id": 1, "Name": 1, "Surname": 1}
+                )
+                async for leader_doc in leader_cursor:
+                    name_map[leader_doc["_id"]] = f"{leader_doc.get('Name', '')} {leader_doc.get('Surname', '')}".strip()
+            except Exception as e:
+                print(f"Error fetching leaders: {e}")
+
+        def resolve_leader(lid):
+            if not lid:
+                return ""
+            try:
+                if isinstance(lid, ObjectId):
+                    return name_map.get(lid, "")
+                return name_map.get(ObjectId(str(lid)), "")
+            except Exception:
+                return ""
+
+        # --- Enhanced scoring for name/surname search ---
+        def score_person(person, name_query):
+            if not name_query:
+                return 0
+            name = (person.get("Name") or "").strip().lower()
+            surname = (person.get("Surname") or "").strip().lower()
+            full_name = f"{name} {surname}".strip()
+            query = name_query.strip().lower()
+            parts = query.split()
+            score = 0
+            # Exact full name match
+            if full_name == query:
+                score += 100
+            # Both parts match (order-insensitive)
+            elif len(parts) == 2 and ((name == parts[0] and surname == parts[1]) or (name == parts[1] and surname == parts[0])):
+                score += 80
+            # Name and surname partial matches
+            if all(part in full_name for part in parts):
+                score += 40
+            # Individual part matches
+            for part in parts:
+                if part == name or part == surname:
+                    score += 20
+                elif part in name or part in surname:
+                    score += 10
+            return score
+
+        # Build final response with scoring and sorting
+        final_list = []
+        for person in people_list:
+            leader_path = person.get("LeaderPath", [])
+            leader1 = resolve_leader(leader_path[0]) if len(leader_path) > 0 else ""
+            leader12 = resolve_leader(leader_path[1]) if len(leader_path) > 1 else ""
+            leader144 = resolve_leader(leader_path[2]) if len(leader_path) > 2 else ""
+            leader1728 = resolve_leader(leader_path[3]) if len(leader_path) > 3 else ""
+            full_name = f"{person.get('Name', '')} {person.get('Surname', '')}".strip()
+
+            mapped = {
+                "_id": str(person["_id"]),
+                "Name": person.get("Name", ""),
+                "Surname": person.get("Surname", ""),
+                "Number": person.get("Number", ""),
+                "Email": person.get("Email", ""),
+                "Address": person.get("Address", ""),
+                "Gender": person.get("Gender", ""),
+                "Birthday": person.get("Birthday", ""),
+                "InvitedBy": person.get("InvitedBy", ""),
+                "Stage": person.get("Stage", "Win"),
+                "org_id": person.get("org_id") or person.get("Org_id", ""),
+                "Organization": person.get("Organization") or person.get("Organisation", ""),
+                "LeaderId": str(person["LeaderId"]) if person.get("LeaderId") else "",
+                "LeaderPath": [str(lid) for lid in leader_path],
+                "Date Created": person.get("DateCreated") or person.get("Date Created") or datetime.utcnow().isoformat(),
+                "UpdatedAt": person.get("UpdatedAt") or datetime.utcnow().isoformat(),
+                "Leader @1": leader1,
+                "Leader @12": leader12,
+                "Leader @144": leader144,
+                "Leader @1728": leader1728,
+                "FullName": full_name,
+            }
+            # Add score for sorting if name search is used
+            if name:
+                mapped["_score"] = score_person(person, name)
+            final_list.append(mapped)
+
+        # Sort by score if searching by name
+        if name:
+            final_list.sort(key=lambda x: x.get("_score", 0), reverse=True)
+            for f in final_list:
+                if "_score" in f:
+                    del f["_score"]
+
+        return {
+            "page": page,
+            "perPage": perPage,
+            "total": total_count,
+            "total_pages": (total_count + perPage - 1) // perPage,
+            "results": final_list
+        }
+        
+    except Exception as e:
+        print(f"Error in get_people: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error fetching people: {str(e)}")
+
+# ========== EVENT-SPECIFIC PEOPLE ENDPOINT - RETURNS ALL PEOPLE WITH COMPLETE FIELDS ==========
+@app.get("/events/{event_id}/all-people-for-attendance")
+async def get_all_people_for_event(
+    event_id: str = Path(...),
+    perPage: int = Query(200, ge=1, le=500),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get ALL people with complete fields for event attendance/modals.
+    Returns complete data including all leader fields regardless of organization.
+    BEST ENDPOINT FOR: AttendanceModal, event people selection, searching all attendees
+    """
+    try:
+        # Verify event exists and user has access
+        if not ObjectId.is_valid(event_id):
+            raise HTTPException(status_code=400, detail="Invalid event ID")
+        
+        event = await events_collection.find_one({"_id": ObjectId(event_id)})
+        if not event:
+            raise HTTPException(status_code=404, detail="Event not found")
+        
+        # Build query to get ALL people (no org filtering for events)
+        query = {}
+        
+        # Get total count
+        total_count = await people_collection.count_documents(query)
+        
+        # Use aggregation pipeline for complete data
+        pipeline = [
+            {"$match": query},
+            {"$limit": perPage},
+            {"$project": {
+                "_id": 1,
+                "Name": 1,
+                "Surname": 1,
+                "Number": 1,
+                "Email": 1,
+                "Address": 1,
+                "Gender": 1,
+                "Birthday": 1,
+                "InvitedBy": 1,
+                "Stage": 1,
+                "org_id": 1,
+                "Organization": 1,
+                "Organisation": 1,
+                "LeaderId": 1,
+                "LeaderPath": 1,
+                "Leader @1": 1,
+                "Leader @12": 1,
+                "Leader @144": 1,
+                "Leader @1728": 1,
+                "leader1": 1,
+                "leader12": 1,
+                "leader144": 1,
+                "leader1728": 1,
+                "DateCreated": 1,
+                "UpdatedAt": 1,
+                "Date Created": 1
+            }}
+        ]
+        
+        cursor = people_collection.aggregate(pipeline)
+        people_list = []
+        async for person in cursor:
+            people_list.append(person)
+        
+        # Resolve LeaderPath to names if it exists
+        all_leader_ids = set()
+        for person in people_list:
+            leader_path = person.get("LeaderPath", [])
+            if leader_path:
+                for lid in leader_path:
+                    if lid:
+                        try:
+                            if isinstance(lid, ObjectId):
+                                all_leader_ids.add(lid)
+                            else:
+                                all_leader_ids.add(ObjectId(str(lid)))
+                        except Exception:
+                            pass
+        
+        name_map = {}
+        if all_leader_ids:
             try:
                 leader_cursor = people_collection.find(
                     {"_id": {"$in": list(all_leader_ids)}},
@@ -8382,14 +8783,17 @@ async def get_people(
             except Exception:
                 return ""
         
-        # Build final response
+        # Build final response with all fields
         final_list = []
         for person in people_list:
             leader_path = person.get("LeaderPath", [])
-            leader1 = resolve_leader(leader_path[0]) if len(leader_path) > 0 else ""
-            leader12 = resolve_leader(leader_path[1]) if len(leader_path) > 1 else ""
-            leader144 = resolve_leader(leader_path[2]) if len(leader_path) > 2 else ""
-            leader1728 = resolve_leader(leader_path[3]) if len(leader_path) > 3 else ""
+            
+            # Resolve from LeaderPath if available, otherwise use existing fields
+            leader1 = resolve_leader(leader_path[0]) if len(leader_path) > 0 else (person.get("Leader @1") or person.get("leader1") or "")
+            leader12 = resolve_leader(leader_path[1]) if len(leader_path) > 1 else (person.get("Leader @12") or person.get("leader12") or "")
+            leader144 = resolve_leader(leader_path[2]) if len(leader_path) > 2 else (person.get("Leader @144") or person.get("leader144") or "")
+            leader1728 = resolve_leader(leader_path[3]) if len(leader_path) > 3 else (person.get("Leader @1728") or person.get("leader1728") or "")
+            
             full_name = f"{person.get('Name', '')} {person.get('Surname', '')}".strip()
             
             mapped = {
@@ -8418,23 +8822,175 @@ async def get_people(
             final_list.append(mapped)
         
         return {
-            "page": page,
+            "event_id": event_id,
+            "event_name": event.get("Event Name") or event.get("name", "Unknown Event"),
             "perPage": perPage,
             "total": total_count,
-            "total_pages": (total_count + perPage - 1) // perPage,
             "results": final_list
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error in get_people: {e}")
+        print(f"Error in get_all_people_for_event: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error fetching people: {str(e)}")
+
+# ========== SIMPLE PEOPLE ENDPOINT - NO ORG FILTERING (FOR SEARCH/MODAL) ==========
+@app.get("/people/all-with-fields")
+async def get_all_people_with_fields(
+    perPage: int = Query(200, ge=1, le=500),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get ALL people with complete fields - NO ORGANIZATION FILTERING.
+    Perfect for: Attendance modals, event person selection, comprehensive search.
+    Returns all fields including leaders regardless of user's organization.
+    
+    Usage in frontend:
+    const res = await authFetch(`${BACKEND_URL}/people/all-with-fields?perPage=200`, { headers });
+    """
+    try:
+        # No organization filtering - returns all people
+        query = {}
+        
+        # Get total count
+        total_count = await people_collection.count_documents(query)
+        
+        # Use aggregation for efficiency
+        pipeline = [
+            {"$match": query},
+            {"$limit": perPage},
+            {"$project": {
+                "_id": 1,
+                "Name": 1,
+                "Surname": 1,
+                "Number": 1,
+                "Email": 1,
+                "Address": 1,
+                "Gender": 1,
+                "Birthday": 1,
+                "InvitedBy": 1,
+                "Stage": 1,
+                "org_id": 1,
+                "Organization": 1,
+                "Organisation": 1,
+                "LeaderId": 1,
+                "LeaderPath": 1,
+                "Leader @1": 1,
+                "Leader @12": 1,
+                "Leader @144": 1,
+                "Leader @1728": 1,
+                "leader1": 1,
+                "leader12": 1,
+                "leader144": 1,
+                "leader1728": 1,
+                "DateCreated": 1,
+                "UpdatedAt": 1,
+                "Date Created": 1
+            }}
+        ]
+        
+        cursor = people_collection.aggregate(pipeline)
+        people_list = []
+        async for person in cursor:
+            people_list.append(person)
+        
+        # Resolve LeaderPath to names
+        all_leader_ids = set()
+        for person in people_list:
+            leader_path = person.get("LeaderPath", [])
+            if leader_path:
+                for lid in leader_path:
+                    if lid:
+                        try:
+                            if isinstance(lid, ObjectId):
+                                all_leader_ids.add(lid)
+                            else:
+                                all_leader_ids.add(ObjectId(str(lid)))
+                        except Exception:
+                            pass
+        
+        name_map = {}
+        if all_leader_ids:
+            try:
+                leader_cursor = people_collection.find(
+                    {"_id": {"$in": list(all_leader_ids)}},
+                    {"_id": 1, "Name": 1, "Surname": 1}
+                )
+                async for leader_doc in leader_cursor:
+                    name_map[leader_doc["_id"]] = f"{leader_doc.get('Name', '')} {leader_doc.get('Surname', '')}".strip()
+            except Exception as e:
+                print(f"Error fetching leaders: {e}")
+        
+        def resolve_leader(lid):
+            if not lid:
+                return ""
+            try:
+                if isinstance(lid, ObjectId):
+                    return name_map.get(lid, "")
+                return name_map.get(ObjectId(str(lid)), "")
+            except Exception:
+                return ""
+        
+        # Build final response
+        final_list = []
+        for person in people_list:
+            leader_path = person.get("LeaderPath", [])
+            
+            # Resolve from LeaderPath first, fallback to stored fields
+            leader1 = resolve_leader(leader_path[0]) if len(leader_path) > 0 else (person.get("Leader @1") or person.get("leader1") or "")
+            leader12 = resolve_leader(leader_path[1]) if len(leader_path) > 1 else (person.get("Leader @12") or person.get("leader12") or "")
+            leader144 = resolve_leader(leader_path[2]) if len(leader_path) > 2 else (person.get("Leader @144") or person.get("leader144") or "")
+            leader1728 = resolve_leader(leader_path[3]) if len(leader_path) > 3 else (person.get("Leader @1728") or person.get("leader1728") or "")
+            
+            full_name = f"{person.get('Name', '')} {person.get('Surname', '')}".strip()
+            
+            mapped = {
+                "_id": str(person["_id"]),
+                "Name": person.get("Name", ""),
+                "Surname": person.get("Surname", ""),
+                "Number": person.get("Number", ""),
+                "Email": person.get("Email", ""),
+                "Address": person.get("Address", ""),
+                "Gender": person.get("Gender", ""),
+                "Birthday": person.get("Birthday", ""),
+                "InvitedBy": person.get("InvitedBy", ""),
+                "Stage": person.get("Stage", "Win"),
+                "org_id": person.get("org_id") or person.get("Org_id", ""),
+                "Organization": person.get("Organization") or person.get("Organisation", ""),
+                "LeaderId": str(person["LeaderId"]) if person.get("LeaderId") else "",
+                "LeaderPath": [str(lid) for lid in leader_path],
+                "Date Created": person.get("DateCreated") or person.get("Date Created") or datetime.utcnow().isoformat(),
+                "UpdatedAt": person.get("UpdatedAt") or datetime.utcnow().isoformat(),
+                "Leader @1": leader1,
+                "Leader @12": leader12,
+                "Leader @144": leader144,
+                "Leader @1728": leader1728,
+                "FullName": full_name
+            }
+            final_list.append(mapped)
+        
+        return {
+            "perPage": perPage,
+            "total": total_count,
+            "results": final_list
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error in get_all_people_with_fields: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error fetching people: {str(e)}")
+
     
 @app.get("/people/search")
 async def search_people(
     query: str = Query("", min_length=2),
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(50, ge=1, le=20000),  # Increased max limit to 1000
     current_user: dict = Depends(get_current_user)
 ):
     try:
@@ -8472,22 +9028,61 @@ async def search_people(
             if not org_match:
                 continue
 
+            leader_names = [
+                (leader.get("name") or "").lower()
+                for leader in person.get("leaders", [])
+            ]
+            leader_match = any(search_term in name for name in leader_names)
+
             if (
                 search_term in person.get("FullName", "").lower() or
                 search_term in person.get("Email", "").lower() or
                 search_term in person.get("Number", "") or
                 search_term in person.get("Address", "").lower() or
-                search_term in person.get("Stage", "").lower()
+                search_term in person.get("Stage", "").lower() or
+                search_term in (person.get("Leader @1") or "").lower() or
+                search_term in (person.get("Leader @12") or "").lower() or
+                search_term in (person.get("Leader @144") or "").lower() or
+                search_term in (person.get("Leader @1728") or "").lower() or
+                leader_match
             ):
-                results.append(person)
+                person_copy = person.copy()
+                if person_copy.get("leaders") and not person_copy.get("Leader @1"):
+                    for leader in person_copy["leaders"]:
+                        level = leader.get("level")
+                        name = leader.get("name", "")
+                        if not name:
+                            continue
+                        if level == 1:
+                            person_copy["Leader @1"] = person_copy.get("Leader @1") or name
+                            person_copy["leader1"] = person_copy.get("leader1") or name
+                            person_copy["Leader at 1"] = person_copy.get("Leader at 1") or name
+                        elif level == 12:
+                            person_copy["Leader @12"] = person_copy.get("Leader @12") or name
+                            person_copy["leader12"] = person_copy.get("leader12") or name
+                            person_copy["Leader at 12"] = person_copy.get("Leader at 12") or name
+                        elif level == 144:
+                            person_copy["Leader @144"] = person_copy.get("Leader @144") or name
+                            person_copy["leader144"] = person_copy.get("leader144") or name
+                            person_copy["Leader at 144"] = person_copy.get("Leader at 144") or name
+                        elif level == 1728:
+                            person_copy["Leader @1728"] = person_copy.get("Leader @1728") or name
+                            person_copy["leader1728"] = person_copy.get("leader1728") or name
+                            person_copy["Leader at 1728"] = person_copy.get("Leader at 1728") or name
+                results.append(person_copy)
 
-            if len(results) >= limit:
-                break
+            # Removed early break - search through ALL matching people
+            # if len(results) >= limit:
+            #     break
+
+        # Apply limit only at the end, after collecting all matches
+        limited_results = results[:limit] if limit > 0 else results
 
         return {
             "success": True,
-            "results": results,
-            "total_found": len(results),
+            "results": limited_results,
+            "total_found": len(results),  # Total matches found
+            "returned_count": len(limited_results),  # How many returned (may be less than limit)
             "search_term": query,
             "source": "cache"
         }
@@ -9105,15 +9700,146 @@ async def create_task(task: TaskModel, current_user: dict = Depends(get_current_
 
 # ====================== GET /tasks ======================
 
+@app.get("/tasks/my-special-tasks")
+async def get_my_special_tasks(
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Returns all consolidation and service follow-up tasks
+    for the current user, regardless of date.
+    Matches by assignedfor, assigned_to_email, or leader fields.
+    """
+    try:
+        org_name = None
+        for key in current_user.keys():
+            if key.lower() == "organization":
+                org_name = current_user[key]
+                break
+
+        if not org_name:
+            raise HTTPException(status_code=403, detail="No organization found")
+
+        user_email = current_user.get("email", "").strip().lower()
+        user_name = f"{current_user.get('name', '')} {current_user.get('surname', '')}".strip()
+        timezone = pytz.timezone("Africa/Johannesburg")
+
+        email_regex = {"$regex": f"^{re.escape(user_email)}$", "$options": "i"}
+
+        query = {
+            "Organization": org_name,
+            "$or": [
+                # Must be a consolidation or service follow-up type
+                {"taskType": {"$regex": "^consolidation$", "$options": "i"}},
+                {"taskType": {"$regex": "^service follow up$", "$options": "i"}},
+                {"is_consolidation_task": True},
+                {"is_new_person_task": True},
+            ],
+            # AND must be assigned to this user
+            "$and": [
+                {
+                    "$or": [
+                        {"assignedfor": email_regex},
+                        {"assigned_to_email": email_regex},
+                        {"leader_name": user_name},
+                        {"leader_assigned": user_name},
+                    ]
+                }
+            ]
+        }
+
+        cursor = tasks_collection.find(query).sort("followup_date", -1).limit(200)
+        all_tasks = []
+
+        async for task in cursor:
+            task_date_raw = task.get("followup_date")
+            task_datetime = None
+
+            if task_date_raw:
+                try:
+                    if isinstance(task_date_raw, datetime):
+                        task_datetime = task_date_raw.astimezone(timezone)
+                    elif isinstance(task_date_raw, str):
+                        task_datetime = datetime.fromisoformat(
+                            task_date_raw.replace("Z", "+00:00")
+                        ).astimezone(timezone)
+                    elif isinstance(task_date_raw, dict) and "$date" in task_date_raw:
+                        task_datetime = datetime.fromisoformat(
+                            str(task_date_raw["$date"]).replace("Z", "+00:00")
+                        ).astimezone(timezone)
+                except (ValueError, TypeError, AttributeError) as e:
+                    logging.warning(f"Could not parse followup_date '{task_date_raw}': {e}")
+                    task_datetime = None
+
+            task_type_raw = task.get("taskType", "")
+            task_type_lower = task_type_raw.lower()
+
+            is_consolidation = (
+                bool(task.get("is_consolidation_task")) or
+                task_type_lower == "consolidation"
+            )
+            is_new_person = (
+                bool(task.get("is_new_person_task")) or
+                task_type_lower in ("service follow up", "new_person", "new person")
+            )
+
+            completed_at = task.get("completedAt")
+            created_at = task.get("createdAt") or task.get("created_at")
+
+            def fmt_date(d):
+                if isinstance(d, datetime):
+                    return d.isoformat()
+                if isinstance(d, str):
+                    return d
+                return ""
+
+            all_tasks.append({
+                "_id": str(task["_id"]),
+                "name": task.get("name", ""),
+                "taskType": task_type_raw,
+                "followup_date": task_datetime.isoformat() if task_datetime else None,
+                "status": task.get("status", "Open"),
+                "assignedfor": task.get("assignedfor", ""),
+                "assigned_to_email": task.get("assigned_to_email", ""),
+                "created_by_email": task.get("created_by_email", ""),
+                "created_by_name": task.get("created_by_name", ""),
+                "leader_name": task.get("leader_name", ""),
+                "leader_assigned": task.get("leader_assigned", ""),
+                "type": task.get("type", "consolidation"),
+                "contacted_person": task.get("contacted_person", {}),
+                "isRecurring": bool(task.get("recurring_day")),
+                "is_consolidation_task": is_consolidation,
+                "is_new_person_task": is_new_person,
+                "source_display": task.get("source_display", "Manual"),
+                "consolidation_source": task.get("consolidation_source", "manual"),
+                "decision_date": task.get("decision_date", ""),
+                "decision_display_name": task.get("decision_display_name", ""),
+                "person_name": task.get("person_name", ""),
+                "person_surname": task.get("person_surname", ""),
+                "completedAt": fmt_date(completed_at),
+                "createdAt": fmt_date(created_at),
+                "created_at": task.get("created_at", ""),
+            })
+
+        return {
+            "tasks": all_tasks,
+            "total": len(all_tasks),
+            "status": "success"
+        }
+
+    except Exception as e:
+        logging.error(f"Error in get_my_special_tasks: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/tasks")
 async def get_user_tasks(
     email: str = Query(None),
+    assigned_to_email: str = Query(None),   # add this param
+    assignedfor: str = Query(None),          # add this param
     userId: str = Query(None),
     view_all: bool = Query(False),
     current_user: dict = Depends(get_current_user)
 ):
     try:
-        # === ROBUST ORGANIZATION LOOKUP (ignores case - same as POST) ===
         org_name = None
         for key in current_user.keys():
             if key.lower() == "organization":
@@ -9125,31 +9851,39 @@ async def get_user_tasks(
 
         is_super_admin = current_user.get("role") == "super_admin"
         is_leader = current_user.get("role") in ["admin", "leader", "manager", "org_admin"]
+
+        # Resolve user_email from whichever query param was provided
         if email:
-            user_email = email.lower()
+            user_email = email.strip().lower()
+        elif assigned_to_email:
+            user_email = assigned_to_email.strip().lower()
+        elif assignedfor:
+            user_email = assignedfor.strip().lower()
         elif userId:
             user = await users_collection.find_one({"_id": ObjectId(userId)})
-            if user:
-                user_email = user.get("email", "").lower()
+            user_email = user.get("email", "").lower() if user else ""
         else:
             user_email = current_user.get("email", "").lower()
 
         if not user_email and not (is_leader and view_all):
             return {"error": "User email not found", "status": "failed"}
-        
-        # Build leader full name (kept from your original)
+
         user_name = f"{current_user.get('name', '')} {current_user.get('surname', '')}".strip()
         timezone = pytz.timezone("Africa/Johannesburg")
 
         if is_super_admin and view_all:
-            query = {}                                     
+            query = {}
         elif is_leader and view_all:
-            query = {"Organization": org_name}       
+            query = {"Organization": org_name}
         else:
+            # Case-insensitive email match using regex
+            email_regex = {"$regex": f"^{re.escape(user_email)}$", "$options": "i"}
             query = {
+                "Organization": org_name,   # always scope to org
                 "$or": [
-                    {"assignedfor": user_email},
-                    {"assigned_to_email": user_email},
+                    {"assignedfor": email_regex},
+                    {"assigned_to_email": email_regex},
+                    {"created_by_email": email_regex},   # catches tasks user created
                     {
                         "$and": [
                             {"leader_name": user_name},
@@ -9169,39 +9903,65 @@ async def get_user_tasks(
         all_tasks = []
 
         async for task in cursor:
-            task_date_str = task.get("followup_date")
+            task_date_raw = task.get("followup_date")
             task_datetime = None
-            if task_date_str:
-                if isinstance(task_date_str, datetime):
-                    task_datetime = task_date_str.astimezone(timezone)
-                else:
-                    try:
+
+            if task_date_raw:
+                try:
+                    if isinstance(task_date_raw, datetime):
+                        # MongoDB native datetime (the $date object case)
+                        task_datetime = task_date_raw.astimezone(timezone)
+                    elif isinstance(task_date_raw, str):
+                        # Plain ISO string — your new tasks store it this way
                         task_datetime = datetime.fromisoformat(
-                            str(task_date_str).replace("Z", "+00:00")
+                            task_date_raw.replace("Z", "+00:00")
                         ).astimezone(timezone)
-                    except ValueError:
-                        logging.warning(f"Invalid date format: {task_date_str}")
-                        continue
+                    elif isinstance(task_date_raw, dict) and "$date" in task_date_raw:
+                        # Fallback: raw extended JSON dict (shouldn't happen via motor but safe)
+                        task_datetime = datetime.fromisoformat(
+                            str(task_date_raw["$date"]).replace("Z", "+00:00")
+                        ).astimezone(timezone)
+                except (ValueError, TypeError, AttributeError) as e:
+                    logging.warning(f"Could not parse followup_date '{task_date_raw}': {e}")
+                    # Don't skip — still include the task, just without a parsed date
+                    task_datetime = None
+
+            # Resolve task type display — normalise casing
+            task_type_raw = task.get("taskType", "")
+            task_type_lower = task_type_raw.lower()
+
+            # Detect special task types regardless of casing
+            is_consolidation = bool(task.get("is_consolidation_task")) or task_type_lower == "consolidation"
+            is_new_person = (
+                task_type_lower in ("service follow up", "new_person", "new person")
+                or bool(task.get("is_new_person_task"))
+            )
 
             all_tasks.append({
                 "_id": str(task["_id"]),
                 "name": task.get("name", "Unnamed Task"),
-                "taskType": task.get("taskType", ""),
+                "taskType": task_type_raw,
                 "followup_date": task_datetime.isoformat() if task_datetime else None,
                 "status": task.get("status", "Open"),
                 "assignedfor": task.get("assignedfor", ""),
                 "assigned_to_email": task.get("assigned_to_email", ""),
                 "created_by_email": task.get("created_by_email", ""),
+                "created_by_name": task.get("created_by_name", ""),
                 "leader_name": task.get("leader_name", ""),
+                "leader_assigned": task.get("leader_assigned", ""),   # was missing
                 "type": task.get("type", "call"),
                 "contacted_person": task.get("contacted_person", {}),
                 "isRecurring": bool(task.get("recurring_day")),
-                "is_consolidation_task": bool(task.get("is_consolidation_task")),
+                "is_consolidation_task": is_consolidation,
+                "is_new_person_task": is_new_person,              # was missing
                 "consolidation_source": task.get("consolidation_source", "manual"),
-                "source_display": task.get("source_display", "Manual")
+                "source_display": task.get("source_display", "Manual"),
+                # Include raw dates as fallbacks for the frontend
+                "createdAt": task.get("createdAt").isoformat() if isinstance(task.get("createdAt"), datetime) else str(task.get("createdAt", "")),
+                "completedAt": task.get("completedAt").isoformat() if isinstance(task.get("completedAt"), datetime) else str(task.get("completedAt", "")),
+                "decision_date": task.get("decision_date", ""),
             })
 
-        # Sort newest first
         all_tasks.sort(key=lambda t: t["followup_date"] or "", reverse=True)
 
         return {
@@ -9214,7 +9974,7 @@ async def get_user_tasks(
         }
 
     except Exception as e:
-        logging.error(f"Error in get_user_tasks: {e}")
+        logging.error(f"Error in get_user_tasks: {e}", exc_info=True)
         return {"error": str(e), "status": "failed"}
 
 # ====================== GET /tasktypes (NOW FETCHES BY ORGANIZATION) ======================
@@ -10113,22 +10873,22 @@ async def update_user_role(
                 "supreme_admin": 6
             }
             
-            if not is_supreme:
-                current_user_role_level = ROLE_HIERARCHY.get(current_user.get("role"), 0)
-                target_user_level = ROLE_HIERARCHY.get(old_role, 0)
-                new_role_level = ROLE_HIERARCHY.get(new_role, 0)
+            # if not is_supreme:
+            #     current_user_role_level = ROLE_HIERARCHY.get(current_user.get("role"), 0)
+            #     target_user_level = ROLE_HIERARCHY.get(old_role, 0)
+            #     new_role_level = ROLE_HIERARCHY.get(new_role, 0)
                 
-                if target_user_level >= current_user_role_level:
-                    raise HTTPException(
-                        status_code=403,
-                        detail="Cannot modify users with equal or higher role"
-                    )
+            #     if target_user_level >= current_user_role_level:
+            #         raise HTTPException(
+            #             status_code=403,
+            #             detail="Cannot modify users with equal or higher role"
+            #         )
                 
-                if new_role_level >= current_user_role_level:
-                    raise HTTPException(
-                        status_code=403,
-                        detail="Cannot assign role equal to or higher than your own"
-                    )
+            #     if new_role_level >= current_user_role_level:
+            #         raise HTTPException(
+            #             status_code=403,
+            #             detail="Cannot assign role equal to or higher than your own"
+            #         )
         else:
             if new_role == "admin" and not is_supreme:
                 raise HTTPException(
@@ -10136,22 +10896,22 @@ async def update_user_role(
                     detail="Cannot assign admin role"
                 )
             
-            if new_role in system_roles and not is_supreme:
-                ROLE_HIERARCHY = {
-                    "registrant": 2,
-                    "user": 1,
-                    "leader": 3,
-                    "leaderAt12": 4,
-                    "admin": 5
-                }
+            # if new_role in system_roles and not is_supreme:
+            #     ROLE_HIERARCHY = {
+            #         "registrant": 2,
+            #         "user": 1,
+            #         "leader": 3,
+            #         "leaderAt12": 4,
+            #         "admin": 5
+            #     }
                 current_user_role_level = ROLE_HIERARCHY.get(current_user.get("role"), 0)
                 new_role_level = ROLE_HIERARCHY.get(new_role, 0)
                 
-                if new_role_level >= current_user_role_level:
-                    raise HTTPException(
-                        status_code=403,
-                        detail="Cannot assign system role equal to or higher than your own"
-                    )
+                # if new_role_level >= current_user_role_level:
+                #     raise HTTPException(
+                #         status_code=403,
+                #         detail="Cannot assign system role equal to or higher than your own"
+                #     )
         
         result = await users_collection.update_one(
             {"_id": ObjectId(user_id)},
@@ -12401,12 +13161,27 @@ async def get_dashboard_comprehensive(
                 email = user.get("email", "").lower()
                 if not email:
                     continue
-                
-                full_name = f"{user.get('name', '')} {user.get('surname', '')}".strip()
+
+                person = await users_collection.find_one({
+                    "$or": [
+                        {"Email": {"$regex": f"^{email}$", "$options": "i"}},
+                        {"user_id": uid}
+                    ]
+                })
+
+                if person:
+                    full_name = f"{person.get('Name', '').strip()} {person.get('Surname', '').strip()}".strip()
+                else:
+                    full_name = f"{user.get('name', '')} {user.get('surname', '')}".strip()
+
                 if not full_name:
                     full_name = email.split("@")[0]
 
-                all_users_map[email] = {"_id": uid, "email": email, "fullName": full_name}
+                all_users_map[email] = {
+                    "_id": uid,
+                    "email": email,
+                    "fullName": full_name
+                }
                 all_users_map[uid] = all_users_map[email]
 
         except Exception as e:
@@ -14199,4 +14974,4 @@ async def preview_spreadsheet_columns(
         "column_mapping": column_mapping,
         "ignored_columns": [c["original"] for c in column_mapping if c["status"] == "ignored"],
         "sample_rows":    sample,
-    }
+    }  
