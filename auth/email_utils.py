@@ -1,6 +1,13 @@
 import os
 import resend
+from dotenv import load_dotenv
 
+# Get the directory where this file is located
+current_dir = Path(__file__).parent.parent  # Goes up to activeteamsbackend folder
+env_path = current_dir / ".env"
+
+# Load the .env file from the exact location
+load_dotenv(dotenv_path=env_path)
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 FROM_EMAIL = os.getenv("FROM_EMAIL")
 
