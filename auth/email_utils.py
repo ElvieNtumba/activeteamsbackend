@@ -1,11 +1,18 @@
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 import os
+from dotenv import load_dotenv
+
+load_dotenv() 
 
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
 FROM_EMAIL = os.getenv("FROM_EMAIL", "activeteams10@gmail.com")
 
+print(f"🔑 SendGrid API Key loaded: {'YES' if SENDGRID_API_KEY else 'NO'}")
+print(f"📧 From Email: {FROM_EMAIL}")
+
 def send_reset_email(to_email: str, recipient_name: str, reset_link: str):
+    print(f"📧 Attempting to send email to: {to_email}")
     subject = "Reset Your Password - Active Teams Church"
     html_content = f"""
     <html>
