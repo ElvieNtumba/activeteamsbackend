@@ -403,6 +403,7 @@ class ConsolidationSource(str, Enum):
     MANUAL = "manual"
     SERVICE = "service_consolidation"
     EVENT = "event_consolidation"
+    CELL = "cell_consolidation"
 
 class ConsolidationCreate(BaseModel):
     person_name: str
