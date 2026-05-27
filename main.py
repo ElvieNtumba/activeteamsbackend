@@ -1,8 +1,6 @@
-
 import os
 from datetime import datetime, timedelta, date, timezone
 import time
-from bson import ObjectId
 import re
 from fastapi import Body, FastAPI, HTTPException, Query, Path, Request ,  Depends, BackgroundTasks, File, UploadFile
 from fastapi.responses import JSONResponse
@@ -11,7 +9,7 @@ from auth.models import EventCreate,DecisionType, UserProfile, ConsolidationCrea
 from auth.utils import hash_password, verify_password, get_next_occurrence_single, parse_time_string, get_leader_cell_name_async, create_access_token, decode_access_token , task_type_serializer, get_current_user 
 import math
 import secrets
-from database import db, events_collection, people_collection, users_collection, tasks_collection ,tasktypes_collection,consolidations_collection, organizations_collection, org_config_collection
+from database import db, events_collection, people_collection, users_collection, tasks_collection ,tasktypes_collection, organizations_collection, org_config_collection, ObjectId
 from auth.email_utils import send_reset_email
 from typing import  List,  Optional,  Dict
 from collections import Counter
@@ -30,6 +28,8 @@ from apscheduler.schedulers.background import BackgroundScheduler, BlockingSched
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from time import sleep
 from supreme_admin import router as supreme_admin_router
+from supabase_helpers.supabase_client import supabase
+
 app = FastAPI()
 
 import pandas as pd
@@ -137,20 +137,18 @@ def serialize_doc(doc: dict) -> dict:
     return out
 
 DB_NAME = os.getenv("DB_NAME", "active-teams-db")
-consolidations_collection = db.get_collection("consolidations")
+# REMOVED DUPLICATE: consolidations_collection already imported from database on line 14
 
 
 def get_database_client():
-    """Return a Mongo client instance compatible with existing `db` usage."""
+    """Return a Supabase client instance for low-level access."""
     try:
         client = getattr(db, "client", None)
         if client:
             return client
     except Exception:
         pass
-    from motor.motor_asyncio import AsyncIOMotorClient
-    mongo_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
-    return AsyncIOMotorClient(mongo_uri)
+    return supabase
 
 
 def convert_datetime_to_iso(doc: dict) -> dict:
@@ -210,6 +208,15 @@ async def user_has_cell(user_email: str) -> bool:
         return bool(sample)
     except Exception:
         return False
+
+
+@app.get("/test/supabase")
+async def test_supabase():
+    try:
+        result = supabase.table("your_table_name").select("*").limit(1).execute()
+        return {"status" : "connected", "sample": result.data}
+    except Exception as e:
+        return {"status": "failed", "error": str(e)}
 
 
 def build_event_object(event: dict, timezone, today_date: date) -> dict:
@@ -437,7 +444,6 @@ def transform_person_full(p, id_to_full: dict = None):
     Like transform_person but also falls back to legacy Leader @N string fields
     if LeaderPath is empty. This ensures the cache always has leaders[] populated.
     """
-    from bson import ObjectId
 
     def oid(v):
         return str(v) if v else None
@@ -7364,7 +7370,9 @@ async def get_event_statistics(
         if not ObjectId.is_valid(event_id):
             raise HTTPException(status_code=400, detail="Invalid event ID")
         
-        event = await events_collection.find_one({"_id": ObjectId(event_id)})
+        event = None  # TODO: Replace with Supabase query — supabase.table("Events").select("*").eq("id", event_id).single()
+        # event = await events_collection.find_one({"_id": ObjectId(event_id)})
+        # REVIEW: Mongo direct collection lookup in migrated stats route
         if not event:
             raise HTTPException(status_code=404, detail="Event not found")
         
@@ -12048,7 +12056,9 @@ async def get_service_checkin_real_time_data(
         if not ObjectId.is_valid(base_event_id):
             raise HTTPException(status_code=400, detail="Invalid event ID")
  
-        event = await events_collection.find_one({"_id": ObjectId(base_event_id)})
+        event = None  # TODO: Replace with Supabase query — supabase.table("Events").select("*").eq("id", base_event_id).single()
+        # event = await events_collection.find_one({"_id": ObjectId(base_event_id)})
+        # REVIEW: Mongo direct collection lookup in migrated service-checkin real-time data route
         if not event:
             raise HTTPException(status_code=404, detail="Event not found")
  
@@ -12111,7 +12121,9 @@ async def validate_removal(
         if not consolidation_id and not person_id:
             raise HTTPException(status_code=400, detail="Either consolidation_id or person_id is required")
  
-        event = await events_collection.find_one({"_id": ObjectId(event_id)})
+        event = None  # TODO: Replace with Supabase query — supabase.table("Events").select("*").eq("id", event_id).single()
+        # event = await events_collection.find_one({"_id": ObjectId(event_id)})
+        # REVIEW: Mongo direct collection lookup in migrated service-checkin validation route
         if not event:
             raise HTTPException(status_code=404, detail="Event not found")
  
@@ -12129,7 +12141,9 @@ async def validate_removal(
         if consolidation:
             task_id = consolidation.get("task_id")
             if task_id and ObjectId.is_valid(task_id):
-                task = await tasks_collection.find_one({"_id": ObjectId(task_id)})
+                task = None  # TODO: Replace with Supabase query — supabase.table("tasks").select("*").eq("id", task_id).single()
+                # task = await tasks_collection.find_one({"_id": ObjectId(task_id)})
+                # REVIEW: Mongo direct collection lookup in migrated service-checkin validation route
                 if task:
                     affected_tasks.append(task)
                     warnings.append(f"Task for {task.get('contacted_person', {}).get('name', 'Unknown')} will be deleted")
@@ -12161,7 +12175,9 @@ async def service_checkin_person(
         if not event_id or not ObjectId.is_valid(event_id):
             raise HTTPException(status_code=400, detail="Invalid event ID")
  
-        event = await events_collection.find_one({"_id": ObjectId(event_id)})
+        event = None  # TODO: Replace with Supabase query — supabase.table("Events").select("*").eq("id", event_id).single()
+        # event = await events_collection.find_one({"_id": ObjectId(event_id)})
+        # REVIEW: Mongo direct collection lookup in migrated service-checkin checkin route
         if not event:
             raise HTTPException(status_code=404, detail="Event not found")
  
@@ -12178,7 +12194,9 @@ async def service_checkin_person(
             if not person_id or not ObjectId.is_valid(person_id):
                 raise HTTPException(status_code=400, detail="Valid person ID is required")
  
-            existing = await people_collection.find_one({"_id": ObjectId(person_id)})
+            existing = None  # TODO: Replace with Supabase query — supabase.table("People").select("*").eq("id", person_id).single()
+            # existing = await people_collection.find_one({"_id": ObjectId(person_id)})
+            # REVIEW: Mongo direct collection lookup in migrated service-checkin checkin route
             if not existing:
                 raise HTTPException(status_code=404, detail="Person does not exist")
  
@@ -12194,36 +12212,17 @@ async def service_checkin_person(
             }
  
             if is_recurring:
-                result = await events_collection.update_one(
-                    {
-                        "_id": ObjectId(event_id),
-                        f"attendance.{instance_date}.attendees.id": {"$ne": attendee_record["id"]}
-                    },
-                    {
-                        "$push": {f"attendance.{instance_date}.attendees": attendee_record},
-                        "$set": {
-                            f"attendance.{instance_date}.updated_at": now,
-                            "updated_at": now
-                        }
-                    }
-                )
+                result = None  # TODO: Replace with Supabase query — supabase.table("Events").update(...)
+                # REVIEW: Mongo direct update removed in migrated service-checkin checkin route
             else:
-                result = await events_collection.update_one(
-                    {
-                        "_id": ObjectId(event_id),
-                        "attendees.id": {"$ne": attendee_record["id"]}
-                    },
-                    {
-                        "$push": {"attendees": attendee_record},
-                        "$inc": {"total_attendance": 1},
-                        "$set": {"updated_at": now}
-                    }
-                )
+                result = None  # TODO: Replace with Supabase query — supabase.table("Events").update(...)
+                # REVIEW: Mongo direct update removed in migrated service-checkin checkin route
  
             if result.modified_count == 0:
                 raise HTTPException(status_code=400, detail=f"{existing.get('Name')} is already checked in")
  
-            updated_event = await events_collection.find_one({"_id": ObjectId(event_id)})
+            updated_event = None  # TODO: Replace with Supabase query — supabase.table("Events").select("*").eq("id", event_id).single()
+            # updated_event = await events_collection.find_one({"_id": ObjectId(event_id)})
             if is_recurring:
                 date_data = updated_event.get("attendance", {}).get(instance_date, {})
                 present_count = len(date_data.get("attendees", []))
@@ -12254,20 +12253,16 @@ async def service_checkin_person(
             }
  
             if is_recurring:
-                await events_collection.update_one(
-                    {"_id": ObjectId(event_id)},
-                    {
-                        "$push": {f"attendance.{instance_date}.new_people": new_person_record},
-                        "$set": {f"attendance.{instance_date}.updated_at": now, "updated_at": now}
-                    }
-                )
+                # TODO: Replace with Supabase query — supabase.table("Events").update(...)
+                # REVIEW: Mongo direct update removed in migrated service-checkin checkin route
+                pass
             else:
-                await events_collection.update_one(
-                    {"_id": ObjectId(event_id)},
-                    {"$push": {"new_people": new_person_record}, "$set": {"updated_at": now}}
-                )
+                # TODO: Replace with Supabase query — supabase.table("Events").update(...)
+                # REVIEW: Mongo direct update removed in migrated service-checkin checkin route
+                pass
  
-            updated_event = await events_collection.find_one({"_id": ObjectId(event_id)})
+            updated_event = None  # TODO: Replace with Supabase query — supabase.table("Events").select("*").eq("id", event_id).single()
+            # updated_event = await events_collection.find_one({"_id": ObjectId(event_id)})
             if is_recurring:
                 date_data = updated_event.get("attendance", {}).get(instance_date, {})
                 count = len(date_data.get("new_people", []))
@@ -12312,7 +12307,9 @@ async def remove_from_service_checkin(
         if data_type not in valid_types:
             raise HTTPException(status_code=400, detail=f"Type must be one of: {valid_types}")
  
-        event = await events_collection.find_one({"_id": ObjectId(event_id)})
+        event = None  # TODO: Replace with Supabase query — supabase.table("Events").select("*").eq("id", event_id).single()
+        # event = await events_collection.find_one({"_id": ObjectId(event_id)})
+        # REVIEW: Mongo direct collection lookup in migrated service-checkin remove route
         if not event:
             raise HTTPException(status_code=404, detail="Event not found")
  
@@ -12323,13 +12320,14 @@ async def remove_from_service_checkin(
             tz = pytz.timezone("Africa/Johannesburg")
             instance_date = datetime.now(tz).date().isoformat()
  
-            result = await events_collection.update_one(
-                {"_id": ObjectId(event_id)},
-                {
-                    "$pull": {f"attendance.{instance_date}.{data_type}": {"id": person_id}},
-                    "$set": {f"attendance.{instance_date}.updated_at": now, "updated_at": now}
-                }
-            )
+            result = None  # TODO: Replace with Supabase query — supabase.table("Events").update(...)
+            # result = await events_collection.update_one(
+                # {"_id": ObjectId(event_id)},
+                # {
+                #     "$pull": {f"attendance.{instance_date}.{data_type}": {"id": person_id}},
+                #     "$set": {f"attendance.{instance_date}.updated_at": now, "updated_at": now}
+                # }
+            # )
         else:
             update_query = {
                 "$pull": {data_type: {"id": person_id}},
@@ -12337,12 +12335,14 @@ async def remove_from_service_checkin(
             }
             if data_type == "attendees":
                 update_query["$inc"] = {"total_attendance": -1}
-            result = await events_collection.update_one({"_id": ObjectId(event_id)}, update_query)
+            result = None  # TODO: Replace with Supabase query — supabase.table("Events").update(...)
+            # result = await events_collection.update_one({"_id": ObjectId(event_id)}, update_query)
  
         if result.modified_count == 0:
             raise HTTPException(status_code=404, detail="Person not found in specified list")
  
-        updated_event = await events_collection.find_one({"_id": ObjectId(event_id)})
+        updated_event = None  # TODO: Replace with Supabase query — supabase.table("Events").select("*").eq("id", event_id).single()
+        # updated_event = await events_collection.find_one({"_id": ObjectId(event_id)})
  
         if is_recurring:
             date_data = updated_event.get("attendance", {}).get(instance_date, {})
@@ -12395,7 +12395,9 @@ async def update_service_checkin_person(
         if data_type not in valid_types:
             raise HTTPException(status_code=400, detail=f"Type must be one of: {valid_types}")
  
-        event = await events_collection.find_one({"_id": ObjectId(event_id)})
+        event = None  # TODO: Replace with Supabase query — supabase.table("Events").select("*").eq("id", event_id).single()
+        # event = await events_collection.find_one({"_id": ObjectId(event_id)})
+        # REVIEW: Mongo direct collection lookup in migrated service-checkin update route
         if not event:
             raise HTTPException(status_code=404, detail="Event not found")
  
@@ -12413,26 +12415,28 @@ async def update_service_checkin_person(
             set_fields[f"attendance.{instance_date}.updated_at"] = now
             set_fields["updated_at"] = now
  
-            result = await events_collection.update_one(
-                {
-                    "_id": ObjectId(event_id),
-                    f"attendance.{instance_date}.{data_type}.id": person_id
-                },
-                {"$set": set_fields}
-            )
+            result = None  # TODO: Replace with Supabase query — supabase.table("Events").update(...)
+            # result = await events_collection.update_one(
+                # {
+                #     "_id": ObjectId(event_id),
+                #     f"attendance.{instance_date}.{data_type}.id": person_id
+                # },
+                # {"$set": set_fields}
+            # )
         else:
             set_fields = {}
             for field, value in update_fields.items():
                 set_fields[f"{data_type}.$.{field}"] = value
             set_fields["updated_at"] = now
  
-            result = await events_collection.update_one(
-                {
-                    "_id": ObjectId(event_id),
-                    f"{data_type}.id": person_id
-                },
-                {"$set": set_fields}
-            )
+            result = None  # TODO: Replace with Supabase query — supabase.table("Events").update(...)
+            # result = await events_collection.update_one(
+                # {
+                #     "_id": ObjectId(event_id),
+                #     f"{data_type}.id": person_id
+                # },
+                # {"$set": set_fields}
+            # )
  
         if result.modified_count == 0:
             raise HTTPException(status_code=404, detail="Person not found or no changes made")
@@ -14802,4 +14806,4 @@ async def preview_spreadsheet_columns(
         "column_mapping": column_mapping,
         "ignored_columns": [c["original"] for c in column_mapping if c["status"] == "ignored"],
         "sample_rows":    sample,
-    }  
+    }
