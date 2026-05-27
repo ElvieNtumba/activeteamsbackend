@@ -9532,11 +9532,6 @@ async def create_task(task: TaskModel, current_user: dict = Depends(get_current_
 async def get_my_special_tasks(
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Returns all consolidation and service follow-up tasks
-    for the current user, regardless of date.
-    Matches by assignedfor, assigned_to_email, or leader fields.
-    """
     try:
         org_name = None
         for key in current_user.keys():
@@ -9554,22 +9549,35 @@ async def get_my_special_tasks(
         email_regex = {"$regex": f"^{re.escape(user_email)}$", "$options": "i"}
 
         query = {
-            "Organization": org_name,
-            "$or": [
-                # Must be a consolidation or service follow-up type
-                {"taskType": {"$regex": "^consolidation$", "$options": "i"}},
-                {"taskType": {"$regex": "^service follow up$", "$options": "i"}},
-                {"is_consolidation_task": True},
-                {"is_new_person_task": True},
-            ],
-            # AND must be assigned to this user
             "$and": [
+                # 1. Organization Scope: Match org_name OR allow cell tasks that lack the field entirely
+                {
+                    "$or": [
+                        {"Organization": org_name},
+                        {"Organization": {"$exists": False}},
+                        {"Organization": None}
+                    ]
+                },
+                # 2. Task Category Scope: Match any consolidation or special task criteria
+                {
+                    "$or": [
+                        {"taskType": {"$regex": "^consolidation$", "$options": "i"}},
+                        {"taskType": {"$regex": "^service follow up$", "$options": "i"}},
+                        {"taskType": {"$regex": "^cell consolidation$", "$options": "i"}},
+                        {"is_consolidation_task": True},
+                        {"is_new_person_task": True},
+                        {"consolidation_source": "cell_consolidation"},
+                        {"source": "cell_consolidation"}  # Added to match raw cell schema
+                    ]
+                },
+                # 3. Ownership Scope: Must be assigned to or created by this user
                 {
                     "$or": [
                         {"assignedfor": email_regex},
                         {"assigned_to_email": email_regex},
                         {"leader_name": user_name},
                         {"leader_assigned": user_name},
+                        {"created_by": email_regex}
                     ]
                 }
             ]
@@ -9601,13 +9609,17 @@ async def get_my_special_tasks(
             task_type_raw = task.get("taskType", "")
             task_type_lower = task_type_raw.lower()
 
+            # Ensure both fallback field variants determine consolidation flags accurately
             is_consolidation = (
                 bool(task.get("is_consolidation_task")) or
-                task_type_lower == "consolidation"
+                task_type_lower in ("consolidation", "cell consolidation") or
+                task.get("consolidation_source") == "cell_consolidation" or
+                task.get("source") == "cell_consolidation"
             )
             is_new_person = (
                 bool(task.get("is_new_person_task")) or
-                task_type_lower in ("service follow up", "new_person", "new person")
+                task_type_lower in ("service follow up", "new_person", "new person") or
+                task.get("source") == "service_consolidation"
             )
 
             completed_at = task.get("completedAt")
@@ -9624,6 +9636,8 @@ async def get_my_special_tasks(
                 "_id": str(task["_id"]),
                 "name": task.get("name", ""),
                 "taskType": task_type_raw,
+                "consolidation_source": task.get("consolidation_source") or task.get("source") or "manual",
+                "source_display": task.get("source_display", "Manual"),
                 "followup_date": task_datetime.isoformat() if task_datetime else None,
                 "status": task.get("status", "Open"),
                 "assignedfor": task.get("assignedfor", ""),
@@ -9637,8 +9651,6 @@ async def get_my_special_tasks(
                 "isRecurring": bool(task.get("recurring_day")),
                 "is_consolidation_task": is_consolidation,
                 "is_new_person_task": is_new_person,
-                "source_display": task.get("source_display", "Manual"),
-                "consolidation_source": task.get("consolidation_source", "manual"),
                 "decision_date": task.get("decision_date", ""),
                 "decision_display_name": task.get("decision_display_name", ""),
                 "person_name": task.get("person_name", ""),
@@ -11406,7 +11418,6 @@ async def create_consolidation(
                     ]}}
                 ]
             })
-            # After the leader lookup attempt, add:
             print(f"Leader lookup for '{consolidation.assigned_to}': found={leader_person is not None}, email={leader_email}")
             if leader_person:
                 leader_email = leader_person.get("Email")
@@ -11427,6 +11438,8 @@ async def create_consolidation(
                     print(f"Found leader email from users: {leader_email}")
 
         if leader_email:
+            # Plan Change / Normalization: Lowercase email to ensure accurate database lookup
+            leader_email = leader_email.strip().lower()
             leader_user = await users_collection.find_one({"email": leader_email})
             if leader_user:
                 leader_user_id = str(leader_user["_id"])
@@ -11438,7 +11451,17 @@ async def create_consolidation(
 
         decision_display_name = "First Time Decision" if consolidation.decision_type == DecisionType.FIRST_TIME else "Recommitment"
         consolidation_source = getattr(consolidation, 'source', 'manual')
-        source_display = "Service" if consolidation_source == "service_consolidation" else "Event" if consolidation_source == "event_consolidation" else "Manual"
+        
+        # XMind Requirement: Map source to display name
+        if consolidation_source == "service_consolidation":
+            source_display = "Service"
+        elif consolidation_source == "event_consolidation":
+            source_display = "Event"
+        elif consolidation_source == "cell_consolidation":
+            source_display = "Cell"
+        else:
+            source_display = "Manual"
+            
         assigned_for = leader_email if leader_email else consolidation.assigned_to
        
         # 3. Create task
@@ -11588,7 +11611,7 @@ async def create_consolidation(
         print(f"Error creating consolidation: {str(e)}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error creating consolidation: {str(e)}")   
+        raise HTTPException(status_code=500, detail=f"Error creating consolidation: {str(e)}")
     
 @app.get("/api/users")
 async def get_all_users():
