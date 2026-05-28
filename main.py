@@ -30,7 +30,19 @@ from apscheduler.schedulers.background import BackgroundScheduler, BlockingSched
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from time import sleep
 from supreme_admin import router as supreme_admin_router
-app = FastAPI()
+
+
+#add routers here:
+def include_router(app):
+    #app.include_router(events_router)
+    pass
+
+def start_application():
+    app = FastAPI()
+    include_router(app)
+    return app
+
+app = start_application()
 
 import pandas as pd
 import io
