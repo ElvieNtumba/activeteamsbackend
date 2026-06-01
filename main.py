@@ -10,6 +10,7 @@ from auth.utils import hash_password, verify_password, get_next_occurrence_singl
 import math
 import secrets
 from database import db, events_collection, people_collection, users_collection, tasks_collection ,tasktypes_collection, organizations_collection, org_config_collection, ObjectId
+from supabase_helpers.supabase_client import supabase
 from auth.email_utils import send_reset_email
 from typing import  List,  Optional,  Dict
 from collections import Counter
@@ -224,10 +225,20 @@ async def user_has_cell(user_email: str) -> bool:
 @app.get("/test/supabase")
 async def test_supabase():
     try:
-        result = supabase.table("your_table_name").select("*").limit(1).execute()
-        return {"status" : "connected", "sample": result.data}
+        # Test connection to Organizations table (note: case-sensitive)
+        result = supabase.table("Organizations").select("*").limit(1).execute()
+        return {
+            "status": "connected",
+            "message": "Supabase connection successful",
+            "table_test": "Organizations",
+            "sample_data": result.data if result.data else []
+        }
     except Exception as e:
-        return {"status": "failed", "error": str(e)}
+        return {
+            "status": "failed",
+            "error": str(e),
+            "message": "Failed to connect to Supabase or query table"
+        }
 
 
 def build_event_object(event: dict, timezone, today_date: date) -> dict:
@@ -11001,10 +11012,11 @@ async def startup_event():
     print("=" * 50)
 
     # First migrate existing data to consistent format (optional, can be removed after first run)
-    await migrate_user_fields()
+    # TODO: Fix schema issues - Supabase tables use _id instead of id. Migrations will be re-enabled after schema is fixed.
+    # await migrate_user_fields()
     
     # Then create indexes for performance
-    await create_indexes()
+    # await create_indexes()
     
     print("=" * 50)
     print("Application startup complete")
