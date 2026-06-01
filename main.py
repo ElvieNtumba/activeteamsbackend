@@ -8922,7 +8922,7 @@ async def search_people(
 async def create_person(
     person_data: dict = Body(...),
     current_user: dict = Depends(get_current_user)
-):
+): 
     try:
         org_id = current_user.get("org_id") or (
             current_user.get("Organization", "").lower().replace(" ", "-")
