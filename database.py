@@ -339,7 +339,7 @@ class SupabaseCollection:
 
     async def count_documents(self, query: Optional[Dict[str, Any]] = None) -> int:
         if self._is_simple_query(query):
-            select_clause = "id"
+            select_clause = "*"  # Use "*" instead of "id" to avoid schema-specific issues
             query_args = self._normalize_query(query)
             qb = self._table().select(select_clause, count="exact")
             qb = self._apply_query_filters(qb, query_args)
@@ -414,6 +414,7 @@ class SupabaseCollection:
             if key in {"$or", "$and", "$expr"}:
                 continue
             field = "id" if key == "_id" else key
+            field = self._escape_field_name(field) if any(c in field for c in "@.-") else field
             if isinstance(value, dict):
                 if "$ne" in value:
                     qb = qb.neq(field, value["$ne"])
@@ -453,16 +454,26 @@ class SupabaseCollection:
             rows = [row for row in rows if _matches_query(row, query)]
         return rows
 
+    def _escape_field_name(self, field: str) -> str:
+        """Escape field names for Supabase REST API - quote if contains special chars."""
+        if any(c in field for c in "@.-"):
+            return f'"{field}"'
+        return field
+
     def _projection_to_select(self, projection: Any) -> str:
         if projection is None:
             return "*"
         if isinstance(projection, dict):
-            includes = ["id" if key == "_id" else key for key, value in projection.items() if value]
+            includes = []
+            for key, value in projection.items():
+                if value:
+                    field = "id" if key == "_id" else key
+                    includes.append(self._escape_field_name(field))
             if includes:
                 return ",".join(includes)
             return "*"
         if isinstance(projection, list):
-            return ",".join(projection)
+            return ",".join(self._escape_field_name(f) for f in projection)
         return str(projection)
 
     def _apply_update(self, row: Dict[str, Any], update: Dict[str, Any]) -> SupabaseResult:
@@ -619,9 +630,9 @@ class SupabaseDB:
 db = SupabaseDB(supabase)
 events_collection = db["Events"]
 people_collection = db["People"]
-tasks_collection = db["tasks"]
+tasks_collection = db["Tasks"]
 users_collection = db["Users"]
 tasktypes_collection = db["TaskTypes"]
 org_config_collection = db["OrgConfig"]
-consolidations_collection = db["consolidations"]
-organizations_collection = db["organizations"]
+consolidations_collection = db["Consolidations"]
+organizations_collection = db["Organizations"]
