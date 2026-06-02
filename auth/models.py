@@ -1,13 +1,11 @@
 from fastapi import FastAPI, HTTPException, Request, APIRouter, Body, Path
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
-from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, EmailStr, field_validator
 from enum import Enum
 from typing import Optional, List, Literal, Dict
 from datetime import datetime, date
-from bson import ObjectId
 import uuid
 from urllib.parse import unquote
 
@@ -405,6 +403,7 @@ class ConsolidationSource(str, Enum):
     MANUAL = "manual"
     SERVICE = "service_consolidation"
     EVENT = "event_consolidation"
+    CELL = "cell_consolidation"
 
 class ConsolidationCreate(BaseModel):
     person_name: str

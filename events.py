@@ -12,6 +12,10 @@ from time import sleep
 from urllib.parse import unquote
 from database import db, events_collection, people_collection, users_collection, tasks_collection ,tasktypes_collection,consolidations_collection, organizations_collection, org_config_collection
 from auth.utils import hash_password, verify_password, get_next_occurrence_single, parse_time_string, get_leader_cell_name_async, create_access_token, decode_access_token , task_type_serializer, get_current_user 
+from supabase_helpers.supabase_connection import supabase
+import os
+
+
 router = APIRouter()
 DAY_INDEX = {
     "monday": 0,
@@ -51,6 +55,7 @@ def normalize_time(time_value: str) -> str:
         pass
 
     return time_value
+
 
 
 @router.post("/events")
@@ -248,6 +253,8 @@ async def create_event(event: EventCreate, current_user: dict = Depends(get_curr
 @router.get("/event-types")
 async def get_event_types(current_user: dict = Depends(get_current_user)):
     try:
+        test = supabase.table("events").select("*").limit(10).execute()
+        print(f"Supabase test query result: {test}")
         org_id = current_user.get("org_id") or (current_user.get("organization", "").lower().replace(" ", "-")) or "active-teams"
         org_id = ORG_ID_MAP.get(org_id.lower(), org_id)
 
