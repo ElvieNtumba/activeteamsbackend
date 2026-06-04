@@ -1376,31 +1376,34 @@ async def signup(user: UserCreate):
         "UpdatedAt": datetime.utcnow().isoformat(),
         "user_id": str(user_result.inserted_id)
     }
-   
+
     try:
         person_result = await people_collection.insert_one(person_doc)
         logger.info(f"Person record created successfully for: {email} (ID: {person_result.inserted_id})")
-       
-        # ADD THE NEW PERSON TO BACKGROUND CACHE
+
+        created_doc = await people_collection.find_one({"_id": person_result.inserted_id})
+        created_doc = created_doc or person_doc
+
+        # ADD THE NEW PERSON TO BACKGROUND CACHE using the fresh DB document
         new_person_cache_entry = {
             "_id": str(person_result.inserted_id),
-            "Name": user.name.strip(),
-            "Surname": user.surname.strip(),
-            "Email": email,
-            "Number": user.phone_number.strip(),
-            "Leader @1": leader1,
-            "Leader @12": "",
-            "Leader @144": "",
-            "Leader @1728": "",
-            "FullName": f"{user.name.strip()} {user.surname.strip()}".strip()
+            "Name": created_doc.get("Name", ""),
+            "Surname": created_doc.get("Surname", ""),
+            "Email": created_doc.get("Email", ""),
+            "Number": created_doc.get("Number", ""),
+            "Leader @1": created_doc.get("Leader @1", ""),
+            "Leader @12": created_doc.get("Leader @12", ""),
+            "Leader @144": created_doc.get("Leader @144", ""),
+            "Leader @1728": created_doc.get("Leader @1728", ""),
+            "FullName": f"{created_doc.get('Name', '')} {created_doc.get('Surname', '')}".strip()
         }
         people_cache["data"].append(new_person_cache_entry)
         print(f"Added new person to background cache: {new_person_cache_entry['FullName']}")
-       
+
     except Exception as e:
         logger.error(f"Failed to create person record for {email}: {e}")
-   
-    return {"message": "User created successfully", "Organization": organization,}
+
+    return {"message": "User created successfully", "Organization": organization}
 
 
 # ---------------- Logout ----------------
@@ -9038,12 +9041,12 @@ async def create_person(
         result      = await people_collection.insert_one(person_doc)
         inserted_id = result.inserted_id
 
-        # ── Resolve leaders[] for response ──────────────────────────────
-        path_strs  = [str(lid) for lid in leader_path]
+        created = await people_collection.find_one({"_id": inserted_id})
+        path_strs = [str(lid) for lid in created.get("LeaderPath", []) if lid] if created else []
         id_to_full: dict = {}
-        if leader_path:
+        if path_strs:
             docs = await people_collection.find(
-                {"_id": {"$in": leader_path}},
+                {"_id": {"$in": [ObjectId(pid) for pid in path_strs]}},
                 {"_id": 1, "Name": 1, "Surname": 1, "Email": 1, "Number": 1}
             ).to_list(length=None)
             for d in docs:
@@ -9076,26 +9079,7 @@ async def create_person(
             invalidate_people_cache("create", {"person_id": str(inserted_id)})
         )
 
-        person_response = {
-            "_id":          str(inserted_id),
-            "Name":         person_doc["Name"],
-            "Surname":      person_doc["Surname"],
-            "Email":        person_doc["Email"],
-            "Number":       person_doc["Number"],
-            "Gender":       person_doc["Gender"],
-            "Birthday":     person_doc["Birthday"],
-            "Address":      person_doc["Address"],
-            "InvitedBy":    person_doc["InvitedBy"],
-            "Stage":        person_doc["Stage"],
-            "org_id":       person_doc["org_id"],
-            "Organization": person_doc["Organization"],
-            "LeaderId":     str(leader_id_obj) if leader_id_obj else None,
-            "LeaderPath":   path_strs,
-            "leaders":      leaders_array,
-            "DateCreated":  person_doc["DateCreated"],
-            "UpdatedAt":    person_doc["UpdatedAt"],
-            "FullName":     f"{person_doc['Name']} {person_doc['Surname']}".strip(),
-        }
+        person_response = transform_person_full(created or person_doc, id_to_full=id_to_full)
 
         return {
             "success": True,
@@ -9288,60 +9272,122 @@ async def update_person(
             if src_key in update_data and update_data[src_key] is not None:
                 set_fields[dest_key] = transform(str(update_data[src_key]))
 
-        # ── LeaderPath / LeaderId ───────────────────────────────────────
-        raw_leader = (
-            update_data.get("leaderId")    or
-            update_data.get("leader_id")   or
-            update_data.get("invitedById") or
-            None
-        )
+        # ── Accept legacy/flat leader fields or a `leaders` list from the frontend
+        # When the client sends a `leaders` array or explicit `leader1`/`leader12` etc
+        # update the corresponding legacy string fields so transform_person_full can build names.
+        leader_names = []
+        if "leaders" in update_data and isinstance(update_data.get("leaders"), (list, tuple)):
+            leaders_list = update_data.get("leaders")
+            if len(leaders_list) > 0 and leaders_list[0] is not None:
+                set_fields["Leader @1"] = str(leaders_list[0]).strip()
+            if len(leaders_list) > 1 and leaders_list[1] is not None:
+                set_fields["Leader @12"] = str(leaders_list[1]).strip()
+            if len(leaders_list) > 2 and leaders_list[2] is not None:
+                set_fields["Leader @144"] = str(leaders_list[2]).strip()
+            if len(leaders_list) > 3 and leaders_list[3] is not None:
+                set_fields["Leader @1728"] = str(leaders_list[3]).strip()
+            leader_names = [str(x).strip() for x in leaders_list if x and str(x).strip()]
 
+        # Also accept individual legacy keys sent by some clients
+        for legacy_in, legacy_db in (
+            ("leader1", "Leader @1"), ("Leader @1", "Leader @1"),
+            ("leader12", "Leader @12"), ("Leader @12", "Leader @12"),
+            ("leader144", "Leader @144"), ("Leader @144", "Leader @144"),
+            ("leader1728", "Leader @1728"), ("Leader @1728", "Leader @1728"),
+        ):
+            if legacy_in in update_data and update_data[legacy_in] is not None:
+                set_fields[legacy_db] = str(update_data[legacy_in]).strip()
+
+        if not leader_names:
+            leader_names = [
+                update_data.get("leader1") or update_data.get("Leader @1") or "",
+                update_data.get("leader12") or update_data.get("Leader @12") or "",
+                update_data.get("leader144") or update_data.get("Leader @144") or "",
+                update_data.get("leader1728") or update_data.get("Leader @1728") or "",
+            ]
+            leader_names = [str(x).strip() for x in leader_names if x and str(x).strip()]
+
+        # ── LeaderPath / LeaderId ───────────────────────────────────────
         new_leader_path = []
         new_leader_id   = None
 
-        if raw_leader:
-            try:
-                new_leader_id = ObjectId(str(raw_leader))
-            except Exception:
-                pass
-
-        if new_leader_id:
-            try:
-                inviter_doc = await people_collection.find_one(
-                    {"_id": new_leader_id},
-                    {"_id": 1, "LeaderPath": 1}
-                )
-                if inviter_doc:
-                    inv_path = [
-                        ObjectId(str(x)) for x in inviter_doc.get("LeaderPath", []) if x
-                    ]
-                    new_leader_path = inv_path + [new_leader_id]
-                else:
-                    new_leader_path = [new_leader_id]
-            except Exception as e:
-                print(f"Warning: could not fetch inviter LeaderPath on update: {e}")
-                new_leader_path = [new_leader_id]
-
-        elif "invitedBy" in update_data and update_data["invitedBy"]:
-            inviter_name = update_data["invitedBy"].strip()
-            parts = inviter_name.split()
+        async def resolve_leader_name(name: str):
+            if not name:
+                return None
+            name = str(name).strip()
+            parts = name.split()
             first = parts[0] if parts else ""
-            last  = " ".join(parts[1:]) if len(parts) > 1 else ""
-            inviter_query = {"Name": {"$regex": f"^{re.escape(first)}$", "$options": "i"}}
+            last = " ".join(parts[1:]) if len(parts) > 1 else ""
+            query = {"Name": {"$regex": f"^{re.escape(first)}$", "$options": "i"}}
             if last:
-                inviter_query["Surname"] = {
-                    "$regex": f"^{re.escape(last)}$", "$options": "i"
-                }
-            inviter = await people_collection.find_one(
-                inviter_query, {"_id": 1, "LeaderPath": 1}
+                query["Surname"] = {"$regex": f"^{re.escape(last)}$", "$options": "i"}
+            doc = await people_collection.find_one(query, {"_id": 1, "LeaderPath": 1})
+            return doc
+
+        if leader_names:
+            for leader_name in leader_names:
+                doc = await resolve_leader_name(leader_name)
+                if doc:
+                    doc_id = doc["_id"]
+                    if not new_leader_path or str(new_leader_path[-1]) != str(doc_id):
+                        new_leader_path.append(doc_id)
+            if new_leader_path:
+                new_leader_id = new_leader_path[0]
+                print(f"Resolved leader names {leader_names} to LeaderPath: {new_leader_path}")
+
+        # Fallback: use explicit ID-based leader fields if names don't resolve
+        if not new_leader_path:
+            raw_leader = (
+                update_data.get("leaderId")    or
+                update_data.get("leader_id")   or
+                update_data.get("invitedById") or
+                None
             )
-            if inviter:
-                inv_id   = inviter["_id"]
-                inv_path = [ObjectId(str(x)) for x in inviter.get("LeaderPath", []) if x]
-                new_leader_path = inv_path + [inv_id]
-                new_leader_id   = inv_id
+
+            if raw_leader:
+                try:
+                    new_leader_id = ObjectId(str(raw_leader))
+                except Exception:
+                    new_leader_id = None
+
+            if new_leader_id:
+                try:
+                    inviter_doc = await people_collection.find_one(
+                        {"_id": new_leader_id},
+                        {"_id": 1, "LeaderPath": 1}
+                    )
+                    if inviter_doc:
+                        inv_path = [
+                            ObjectId(str(x)) for x in inviter_doc.get("LeaderPath", []) if x
+                        ]
+                        new_leader_path = inv_path + [new_leader_id]
+                    else:
+                        new_leader_path = [new_leader_id]
+                except Exception as e:
+                    print(f"Warning: could not fetch inviter LeaderPath on update: {e}")
+                    new_leader_path = [new_leader_id]
+
+        # Final fallback: use invitedBy text if no leader names or IDs resolved
+        if not new_leader_path and "invitedBy" in update_data and update_data["invitedBy"]:
+            inviter_name = str(update_data["invitedBy"]).strip()
+            if inviter_name:
+                inviter_doc = await resolve_leader_name(inviter_name)
+                if inviter_doc:
+                    inv_id = inviter_doc["_id"]
+                    inv_path = [ObjectId(str(x)) for x in inviter_doc.get("LeaderPath", []) if x]
+                    new_leader_path = inv_path + [inv_id]
+                    new_leader_id = inv_id
 
         if new_leader_path:
+            # Remove exact duplicate ids from the path while preserving order.
+            seen_ids = set()
+            unique_path = []
+            for lid in new_leader_path:
+                lid_str = str(lid)
+                if lid_str not in seen_ids:
+                    seen_ids.add(lid_str)
+                    unique_path.append(lid)
+            new_leader_path = unique_path
             set_fields["LeaderPath"] = new_leader_path
         if new_leader_id:
             set_fields["LeaderId"] = new_leader_id
@@ -11379,19 +11425,22 @@ async def create_consolidation(
             result = await people_collection.insert_one(person_doc)
             person_id = str(result.inserted_id)
             print(f"Created new person: {person_id}")
-           
+
+            created_doc = await people_collection.find_one({"_id": result.inserted_id})
+            created_doc = created_doc or person_doc
+
             new_person_cache_entry = {
                 "_id": person_id,
-                "Name": consolidation.person_name.strip(),
-                "Surname": consolidation.person_surname.strip(),
-                "Email": person_email,
-                "Number": consolidation.person_phone or "",
-                "Gender": "",
-                "Leader @1": consolidation.leaders[0] if len(consolidation.leaders) > 0 else "",
-                "Leader @12": consolidation.leaders[1] if len(consolidation.leaders) > 1 else "",
-                "Leader @144": consolidation.leaders[2] if len(consolidation.leaders) > 2 else "",
-                "Leader @1728": consolidation.leaders[3] if len(consolidation.leaders) > 3 else "",
-                "FullName": f"{consolidation.person_name.strip()} {consolidation.person_surname.strip()}".strip(),
+                "Name": created_doc.get("Name", ""),
+                "Surname": created_doc.get("Surname", ""),
+                "Email": created_doc.get("Email", ""),
+                "Number": created_doc.get("Number", ""),
+                "Gender": created_doc.get("Gender", ""),
+                "Leader @1": created_doc.get("Leader @1", ""),
+                "Leader @12": created_doc.get("Leader @12", ""),
+                "Leader @144": created_doc.get("Leader @144", ""),
+                "Leader @1728": created_doc.get("Leader @1728", ""),
+                "FullName": f"{created_doc.get('Name', '')} {created_doc.get('Surname', '')}".strip(),
                 "ConsolidationSource": getattr(consolidation, 'source', 'manual')
             }
             people_cache["data"].append(new_person_cache_entry)
