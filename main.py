@@ -1022,6 +1022,7 @@ async def refresh_token(payload: RefreshTokenRequest = Body(...)):
     if (
         not user
         or not user.get("refresh_token_hash")
+        or not getattr(payload, "refresh_token", None)
         or not verify_password(payload.refresh_token, user["refresh_token_hash"])
         or not user.get("refresh_token_expires")
         or user["refresh_token_expires"] < datetime.utcnow()
@@ -1096,23 +1097,60 @@ async def login(user: UserLogin):
             "org_id": org_id
         })
 
-        logger.info(f"Token created for user {user_id}")
+        # Create and persist a refresh token for the session
+        try:
+            new_refresh_token_id = secrets.token_urlsafe(16)
+            new_refresh_plain = secrets.token_urlsafe(32)
+            new_refresh_hash = hash_password(new_refresh_plain)
+            new_refresh_expires = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
 
-        return {
-            "access_token": access_token,
-            "token_type": "bearer",
-            "user": {
-                "id": user_id,
-                "_id": user_id,
-                "email": existing["email"],
-                "name": existing.get("name", ""),
-                "surname": existing.get("surname", ""),
-                "role": existing.get("role", "user"),
-                "organization": organization,
-                "org_id": org_id,
-                "is_supreme_admin": existing.get("is_supreme_admin", False)
+            await users_collection.update_one(
+                {"_id": existing["_id"]},
+                {"$set": {
+                    "refresh_token_id": new_refresh_token_id,
+                    "refresh_token_hash": new_refresh_hash,
+                    "refresh_token_expires": new_refresh_expires,
+                    "org_id": org_id,
+                }}
+            )
+
+            logger.info(f"Token created for user {user_id}")
+
+            return {
+                "access_token": access_token,
+                "token_type": "bearer",
+                "refresh_token_id": new_refresh_token_id,
+                "refresh_token": new_refresh_plain,
+                "user": {
+                    "id": user_id,
+                    "_id": user_id,
+                    "email": existing["email"],
+                    "name": existing.get("name", ""),
+                    "surname": existing.get("surname", ""),
+                    "role": existing.get("role", "user"),
+                    "organization": organization,
+                    "org_id": org_id,
+                    "is_supreme_admin": existing.get("is_supreme_admin", False)
+                }
             }
-        }
+        except Exception as e:
+            logger.error(f"Failed to persist refresh token for {user_id}: {e}")
+            # Still return access token but omit refresh token if persistence failed
+            return {
+                "access_token": access_token,
+                "token_type": "bearer",
+                "user": {
+                    "id": user_id,
+                    "_id": user_id,
+                    "email": existing["email"],
+                    "name": existing.get("name", ""),
+                    "surname": existing.get("surname", ""),
+                    "role": existing.get("role", "user"),
+                    "organization": organization,
+                    "org_id": org_id,
+                    "is_supreme_admin": existing.get("is_supreme_admin", False)
+                }
+            }
     
     except HTTPException:
         raise  # Don't swallow intentional HTTP errors
@@ -1166,6 +1204,19 @@ async def signup(user: UserCreate):
         "created_at": datetime.utcnow().isoformat(),
         "updated_at": datetime.utcnow().isoformat(),
     }
+
+    # Generate initial refresh token for the new user so the client can refresh later
+    try:
+        initial_refresh_token_id = secrets.token_urlsafe(16)
+        initial_refresh_plain = secrets.token_urlsafe(32)
+        initial_refresh_hash = hash_password(initial_refresh_plain)
+        initial_refresh_expires = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+
+        user_dict["refresh_token_id"] = initial_refresh_token_id
+        user_dict["refresh_token_hash"] = initial_refresh_hash
+        user_dict["refresh_token_expires"] = initial_refresh_expires
+    except Exception as e:
+        logger.error(f"Failed to generate initial refresh token for signup {email}: {e}")
 
     inviter_full_name = user.invited_by.strip()
     inviter_person = None
@@ -1403,7 +1454,18 @@ async def signup(user: UserCreate):
     except Exception as e:
         logger.error(f"Failed to create person record for {email}: {e}")
 
-    return {"message": "User created successfully", "Organization": organization}
+    resp = {"message": "User created successfully", "Organization": organization}
+    try:
+        # If we generated an initial refresh token, return it so client can use refresh flow
+        if 'initial_refresh_token_id' in locals() and 'initial_refresh_plain' in locals():
+            resp.update({
+                "refresh_token_id": initial_refresh_token_id,
+                "refresh_token": initial_refresh_plain,
+            })
+    except Exception:
+        pass
+
+    return resp
 
 
 # ---------------- Logout ----------------
