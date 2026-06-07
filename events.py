@@ -1,3 +1,5 @@
+import json
+
 from fastapi import APIRouter, HTTPException, Query, Path, Body, Depends
 from datetime import datetime, timedelta, date, timezone
 from typing import Optional
@@ -28,8 +30,8 @@ DAY_INDEX = {
 }
 
 ORG_ID_MAP = {
-    "active-church": "active-teams",
-    "active church": "active-teams",
+    "active-church": "69c63afc4c3e2fdfc5a4840d",
+    "active church": "69c63afc4c3e2fdfc5a4840d",
 }
 
 # Events Section  ----------------------------------------------
@@ -60,17 +62,18 @@ def normalize_time(time_value: str) -> str:
 
 @router.post("/events")
 async def create_event(event: EventCreate, current_user: dict = Depends(get_current_user)):
+    """
+    create an event of any event type
+    """
     try:
+        print(f"Received event creation request: {event.dict()} from user: {current_user.get('email')}")
         event_data = event.dict()
         event_data["_id"] = ObjectId()
 
-        if not event_data.get("UUID"):
-            event_data["UUID"] = str(uuid.uuid4())
 
         event_type_name = event_data.get("eventTypeName")
         if not event_type_name:
             raise HTTPException(status_code=400, detail="eventTypeName is required")
-
         org_id = current_user.get("org_id", "active-teams")
         org_id = ORG_ID_MAP.get(org_id.lower(), org_id)
         organization = current_user.get("Organization") or current_user.get("organization", "")
@@ -83,47 +86,31 @@ async def create_event(event: EventCreate, current_user: dict = Depends(get_curr
         event_data["org_id"] = org_id
         event_data["Organization"] = organization  # Uppercase O only
 
+        event_type = supabase.table("event_types").select("*").eq("name", event_type_name).eq("org_id", org_id).execute().data
+        print("event_type query result:", event_type,org_id,event_type_name)
         # Check if it's a CELLS type
         if event_type_name.upper() in ["CELLS", "ALL CELLS"]:
-            event_data["eventTypeId"] = "CELLS_BUILT_IN"
-            event_data["eventTypeName"] = "CELLS"
+            print("Creating CELLS event with built-in type")
+            event_data["eventTypeId"] = event_type[0]["event_type_id"] 
+            event_data["eventTypeName"] = "Cells"
             event_data["hasPersonSteps"] = True
             event_data["isGlobal"] = False
             event_data["status"] = "incomplete"
         else:
-            # Try to find the event type - first by name only (without org filter)
-            event_type = await events_collection.find_one({
-                "$or": [
-                    {"name": {"$regex": f"^{event_type_name}$", "$options": "i"}},
-                    {"eventType": {"$regex": f"^{event_type_name}$", "$options": "i"}},
-                    {"eventTypeName": {"$regex": f"^{event_type_name}$", "$options": "i"}}
-                ],
-                "isEventType": True
-            })
+            # Try to find the event type 
             
-            # If found, check if it's global or belongs to the user's org
+                        
+            event_type = event_type[0] if event_type and len(event_type) > 0 else None
+            # If found, check if it's global
             if event_type:
                 is_global = event_type.get("isGlobal", False)
-                event_org_id = event_type.get("org_id", "")
-                
-                # If it's global OR belongs to user's org, use it
-                if is_global or event_org_id == org_id:
-                    print(f"Found event type: {event_type_name} (global={is_global})")
-                    event_data["eventTypeId"] = event_type.get("UUID")
-                    event_data["eventTypeName"] = event_type.get("name")
-                    event_data["isGlobal"] = event_type.get("isGlobal", False)
-                    event_data["hasPersonSteps"] = event_type.get("hasPersonSteps", False)
-                    event_data["isTicketed"] = event_type.get("isTicketed", False)
-                    event_data["status"] = "open"
-                else:
-                    # Event type exists but belongs to different org - create as custom
-                    print(f"Event type '{event_type_name}' belongs to org {event_org_id}, user org is {org_id} - using as custom")
-                    event_data["eventTypeId"] = None
-                    event_data["eventTypeName"] = event_type_name
-                    event_data["isGlobal"] = False
-                    event_data["hasPersonSteps"] = False
-                    event_data["isTicketed"] = False
-                    event_data["status"] = "open"
+                print(f"Found event type: {event_type_name} (global={is_global})")
+                event_data["eventTypeId"] = event_type.get("event_type_id")
+                event_data["eventTypeName"] = event_type.get("name")
+                event_data["isGlobal"] = event_type.get("isGlobal", False)
+                event_data["hasPersonSteps"] = event_type.get("hasPersonSteps", False)
+                event_data["isTicketed"] = event_type.get("isTicketed", False)
+                event_data["status"] = "open"
             else:
                 # Event type not found, use default
                 print(f"Event type '{event_type_name}' not found, using default")
@@ -134,16 +121,19 @@ async def create_event(event: EventCreate, current_user: dict = Depends(get_curr
                 event_data["isTicketed"] = False
                 event_data["status"] = "open"
 
+        
         print(f"Using day value from frontend: {event_data.get('day')}")
 
-        if event_data.get("time") or event_data.get("Time"):
-            raw_time = event_data.get("time") or event_data.get("Time")
+        eventTime = event_data.get("time") or event_data.get("Time")
+        if eventTime:
+            raw_time = eventTime
             print(f"Raw time received from frontend: {raw_time}")
             clean_time = normalize_time(raw_time)
             event_data["time"] = clean_time
             event_data["Time"] = clean_time
             print(f"Time stored as: {clean_time}")
 
+       
         event_data.pop("eventType", None)
 
         if not event_data.get("eventLeaderEmail"):
@@ -211,7 +201,7 @@ async def create_event(event: EventCreate, current_user: dict = Depends(get_curr
             else:
                 first_event_date = reference_date
 
-            event_data["date"] = first_event_date.isoformat()
+            # event_data["date"] = first_event_date.isoformat()
             event_data["day"] = recurring_days[0].capitalize()
             event_data["recurring_day"] = recurring_days
             event_data["attendance"] = {}
@@ -222,26 +212,53 @@ async def create_event(event: EventCreate, current_user: dict = Depends(get_curr
                 event_data["Date Of Event"] = first_event_date.isoformat()
 
             print(f"[RECURRING CREATE] Single doc -> day: {event_data['day']}, date: {event_data['date']}, eventName: {event_data.get('eventName') or event_data.get('Event Name')}, Organization: {event_data['Organization']}")
+            print("Final event object", event_data)
 
-            result = await events_collection.insert_one(event_data)
-            print(f"[RECURRING CREATE] Inserted _id: {result.inserted_id}")
+            final_event_date = event_data.get("date")
+            final_created_date = event_data.get("created_at")
+            final_data = {
+                "event_name": event_data.get("eventName","No Event Name"),
+                "event_type_name": event_data.get("eventTypeName","No Event Type"),
+                "event_type_id":event_data.get("eventTypeId"),
+                "location": event_data.get("location","No Location"),
+                "description": event_data.get("description","No Description"),
+                "event_leader": event_data.get("eventLeader","No Leader"),
+                "event_leader_email": event_data.get("eventLeaderEmail","No Leader Email"),
+                "is_ticketed": event_data.get("isTicketed", False),
+                "is_global": event_data.get("isGlobal", False),
+                "is_active": event_data.get("is_active", True),
+                "has_person_steps": event_data.get("hasPersonSteps", False),
+                "status": event_data.get("status", "open"),
+                "recurring_day": "".join(event_data.get("recurring_day",[""])),
+                "is_recurring": bool(event_data.get("recurring_day")),
+                "organization": event_data.get("Organization"),
+                "event_date": final_event_date.isoformat(),
+                "org_id": event_data.get("org_id")
+
+            }  
+            
+            post_event = supabase.table("events").insert(final_data).execute()
+            result = post_event.data[0]["event_id"]
+            
+            print(f"[RECURRING CREATE] Inserted _id: {result}")
 
             return {
                 "success": True,
                 "message": "Recurring event created successfully",
-                "created_event_ids": [str(result.inserted_id)],
-                "id": str(result.inserted_id),
+                "created_event_ids": result,
+                "id": result,
                 "count": 1
             }
 
-        result = await events_collection.insert_one(event_data)
-        created_event = await events_collection.find_one({"_id": result.inserted_id})
+        post_event = supabase.table("events").insert(final_data).execute()
+        inserted_id = post_event.data[0]["event_id"]
+        created_event = post_event.data[0]
 
         return {
             "success": True,
             "message": "Event created successfully",
-            "id": str(result.inserted_id),
-            "event": {**created_event, "_id": str(created_event["_id"])}
+            "id": inserted_id,
+            "event": {**created_event, "_id": inserted_id}
         }
 
     except Exception as e:
@@ -252,43 +269,19 @@ async def create_event(event: EventCreate, current_user: dict = Depends(get_curr
 
 @router.get("/event-types")
 async def get_event_types(current_user: dict = Depends(get_current_user)):
+    """
+    Fetches event types for the current user's organization from Supabase.
+    """
     try:
-        test = supabase.table("events").select("*").limit(10).execute()
-        print(f"Supabase test query result: {test}")
-        org_id = current_user.get("org_id") or (current_user.get("organization", "").lower().replace(" ", "-")) or "active-teams"
-        org_id = ORG_ID_MAP.get(org_id.lower(), org_id)
+        # test = supabase.table("events").select("*").limit(1).execute()
+        # print(f"Supabase test query result: {test}")
 
+        org_id = current_user.get("org_id") 
+      
         print(f"GET EVENT TYPES — user: {current_user.get('email')} | org_id: {org_id}")
 
-        event_types = []
+        event_types = supabase.table("event_types").select("*").eq("org_id", org_id).execute().data
 
-        if org_id == "active-teams":
-            event_types.append({
-                "_id": "CELLS_BUILT_IN",
-                "id": "CELLS_BUILT_IN",
-                "name": "CELLS",
-                "eventTypeName": "CELLS",
-                "isBuiltIn": True,
-                "isEventType": True,
-                "isGlobal": False,
-                "org_id": org_id
-            })
-
-        cursor = events_collection.find({
-            "isEventType": True,
-            "$or": [
-                {"org_id": org_id},
-                {"Organization": {"$regex": current_user.get("Organization", ""), "$options": "i"}}
-            ]
-        }).sort("createdAt", 1)
-
-        async for et in cursor:
-            et["_id"] = str(et["_id"])
-            if et.get("eventTypeName", "").upper() == "CELLS" or et.get("name", "").upper() == "CELLS":
-                continue
-            event_types.append(et)
-
-        print(f"Found {len(event_types)} event types for org: {org_id}")
         return event_types
 
     except Exception as e:
@@ -1214,6 +1207,7 @@ async def get_other_events(
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
   
 
+#not used
 @router.get("/events/{event_id}/attendance/{week}")
 async def get_weekly_attendance(
     event_id: str = Path(...),

@@ -75,8 +75,8 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 ORG_ID_MAP = {
-    "active-church": "active-teams",
-    "active church": "active-teams",
+    "active-church": "69c63afc4c3e2fdfc5a4840d",
+    "active church": "69c63afc4c3e2fdfc5a4840d",
 }
 
 def get_org_from_user(current_user: dict):
@@ -1864,7 +1864,7 @@ def format_display_date(dt):
 # @app.post("/events")
 # async def create_event(event: EventCreate, current_user: dict = Depends(get_current_user)):
 #     try:
-#         event_data = event.dict()
+        # event_data = event.dict()
 #         event_data["_id"] = ObjectId()
 
 #         if not event_data.get("UUID"):
