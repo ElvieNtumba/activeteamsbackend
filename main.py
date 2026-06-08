@@ -30,6 +30,7 @@ from apscheduler.schedulers.background import BackgroundScheduler, BlockingSched
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from time import sleep
 from supreme_admin import router as supreme_admin_router
+from people import router as people_router
 app = FastAPI()
 
 import pandas as pd
@@ -51,6 +52,7 @@ app.add_middleware(
 )
 
 app.include_router(supreme_admin_router)
+app.include_router(people_router)
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -67,6 +69,21 @@ ORG_ID_MAP = {
     "active-church": "active-teams",
     "active church": "active-teams",
 }
+
+def normalize_user_role(role: str) -> Optional[str]:
+    """Normalize accepted role variants for user search filters."""
+    if not role:
+        return None
+
+    normalized = role.lower().replace("-", "").replace("_", "").replace(" ", "")
+    role_map = {
+        "leaderat1": "leaderAt1",
+        "leaderat12": "leaderAt12",
+        "leaderat144": "leaderAt144",
+        "leaderat1728": "leaderAt1728",
+    }
+
+    return role_map.get(normalized)
 
 def get_org_from_user(current_user: dict):
     if current_user.get("role") == "super_admin":
@@ -2008,7 +2025,14 @@ async def create_event(event: EventCreate, current_user: dict = Depends(get_curr
         if event_data.get("hasPersonSteps"):
             event_data.setdefault("leader1", "")
             event_data.setdefault("leader12", "")
+            event_data.setdefault("leader144", "")
+            event_data.setdefault("leader1728", "")
             event_data.setdefault("persistent_attendees", [])
+
+            # Accept frontend autocomplete leader IDs as safe strings for event storage
+            for leader_field in ["leader1", "leader12", "leader144", "leader1728"]:
+                if leader_field in event_data and event_data[leader_field] is not None:
+                    event_data[leader_field] = str(event_data[leader_field])
 
         if event_data.get("isTicketed") and event_data.get("priceTiers"):
             event_data["priceTiers"] = [
@@ -5432,6 +5456,10 @@ async def create_indexes_on_startup():
         # Indexes for faster admin user queries
         await users_collection.create_index([("organization", 1)], name="users_org_idx")
         await users_collection.create_index([("Organization", 1)], name="users_Org_idx")
+        await users_collection.create_index([("org_id", 1)], name="users_org_id_idx")
+        await users_collection.create_index([("role", 1)], name="users_role_idx")
+        await users_collection.create_index([("name", 1)], name="users_name_idx")
+        await users_collection.create_index([("surname", 1)], name="users_surname_idx")
         await users_collection.create_index([("email", 1)], name="users_email_idx")
        
         print("Indexes created successfully")
@@ -8202,6 +8230,95 @@ async def get_users_by_organization(
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching users: {str(e)}")    
+
+@app.get("/users/search")
+async def search_users_by_role(
+    role: Optional[str] = Query(None, description="Role filter for leader dropdowns, e.g. leader_at_1"),
+    search: Optional[str] = Query(None, description="Case-insensitive partial search text for name or email"),
+    page: int = Query(1, ge=1, description="Page number for pagination"),
+    perPage: int = Query(50, ge=1, le=200, description="Results per page"),
+    current_user: dict = Depends(get_current_user)
+):
+    """Search users by role and partial name/email for autocomplete dropdowns."""
+    try:
+        if not role and not search:
+            raise HTTPException(status_code=400, detail="Either role or search query is required")
+
+        normalized_role = normalize_user_role(role) if role else None
+        if role and not normalized_role:
+            raise HTTPException(status_code=400, detail=f"Invalid role: {role}")
+
+        query = {}
+        if normalized_role:
+            query["role"] = {"$regex": f"^{re.escape(normalized_role)}$", "$options": "i"}
+
+        search_term = (search or "").strip()
+        if search_term and len(search_term) < 2:
+            raise HTTPException(status_code=400, detail="Search query must be at least 2 characters")
+
+        if search_term:
+            regex = {"$regex": re.escape(search_term), "$options": "i"}
+            query["$or"] = [
+                {"name": regex},
+                {"surname": regex},
+                {"email": regex},
+                {
+                    "$expr": {
+                        "$regexMatch": {
+                            "input": {"$concat": ["$name", " ", "$surname"]},
+                            "regex": search_term,
+                            "options": "i"
+                        }
+                    }
+                }
+            ]
+
+        # Restrict non-admins to their own organization
+        if current_user.get("role") != "admin":
+            org_id = current_user.get("org_id") or ""
+            org_name = (current_user.get("Organization") or current_user.get("organization") or "").strip()
+            org_id = ORG_ID_MAP.get(org_id.lower(), org_id)
+
+            if org_id or org_name:
+                org_filters = []
+                if org_id:
+                    org_filters.append({"org_id": {"$regex": f"^{re.escape(org_id)}$", "$options": "i"}})
+                if org_name:
+                    org_filters.append({"organization": {"$regex": f"^{re.escape(org_name)}$", "$options": "i"}})
+                    org_filters.append({"Organization": {"$regex": f"^{re.escape(org_name)}$", "$options": "i"}})
+
+                if org_filters:
+                    query["$and"] = [query.copy()] if query else []
+                    query["$and"].append({"$or": org_filters})
+
+        skip = (page - 1) * perPage
+        cursor = users_collection.find(query, {"password": 0}).sort([("name", 1), ("surname", 1)])
+        total_count = await users_collection.count_documents(query)
+        results = await cursor.skip(skip).limit(perPage).to_list(length=perPage)
+
+        formatted_results = []
+        for user in results:
+            full_name = " ".join(filter(None, [user.get("name", ""), user.get("surname", "")])).strip()
+            formatted_results.append({
+                "_id": str(user.get("_id")),
+                "fullName": full_name,
+                "email": user.get("email", ""),
+                "role": user.get("role", "user")
+            })
+
+        return {
+            "results": formatted_results,
+            "page": page,
+            "perPage": perPage,
+            "total": total_count,
+            "role": normalized_role,
+            "search": search_term
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error searching users: {str(e)}")
 
 @app.post("/users/{user_id}/avatar")
 async def upload_avatar(
@@ -11004,6 +11121,10 @@ async def create_indexes():
         print("✓ Index created on email field")
         
         # Index for refresh_token_id for token management
+        await users_collection.create_index([("role", 1)], name="users_role_idx")
+        print("✓ Index created on role field")
+        await users_collection.create_index([("name", 1), ("surname", 1)], name="users_name_idx")
+        print("✓ Compound index created on name + surname fields")
         await users_collection.create_index("refresh_token_id")
         print("✓ Index created on refresh_token_id field")
         
