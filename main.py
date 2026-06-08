@@ -192,6 +192,36 @@ def get_exact_date_identifier(target_date: date) -> str:
     return str(target_date)
 
 
+def get_attendance_by_date(attendance_data: dict, exact_date: str) -> dict:
+    """Return the attendance entry for the exact event date, including legacy keys."""
+    if not isinstance(attendance_data, dict) or not exact_date:
+        return {}
+
+    exact_date = str(exact_date)
+    attendance = attendance_data.get(exact_date)
+    if isinstance(attendance, dict):
+        return attendance
+
+    for value in attendance_data.values():
+        if not isinstance(value, dict):
+            continue
+        if value.get("event_date_exact") == exact_date:
+            return value
+        event_date_iso = value.get("event_date_iso")
+        if event_date_iso and exact_date in str(event_date_iso):
+            return value
+
+    try:
+        legacy_week_key = datetime.fromisoformat(exact_date).strftime("%G-W%V")
+        legacy_attendance = attendance_data.get(legacy_week_key)
+        if isinstance(legacy_attendance, dict):
+            return legacy_attendance
+    except Exception:
+        pass
+
+    return {}
+
+
 async def user_has_cell(user_email: str) -> bool:
     """Return True if the user (email) has at least one cell event."""
     if not user_email:
@@ -2421,6 +2451,7 @@ async def get_cell_events(
 
         pipeline = [
             {"$match": query},
+            {"$sort": {"updated_at": -1}},
             {
                 "$group": {
                     "_id": {
@@ -2477,31 +2508,17 @@ async def get_cell_events(
                         continue
 
                     exact_date = instance_date.isoformat()
-                    attendance_data = event.get("attendance", {})
-                    attendance = attendance_data.get(exact_date, {})
+                    attendance_data = event.get("attendance", {}) or {}
+                    attendance = get_attendance_by_date(attendance_data, exact_date)
 
-                    if not attendance:
-                        for key, value in attendance_data.items():
-                            if isinstance(value, dict):
-                                if value.get("event_date_exact") == exact_date:
-                                    attendance = value
-                                    break
-                                event_date_iso = value.get("event_date_iso")
-                                if event_date_iso and exact_date in event_date_iso:
-                                    attendance = value
-                                    break
-                        if not attendance:
-                            legacy_week_key = instance_date.strftime("%G-W%V")
-                            legacy_attendance = attendance_data.get(legacy_week_key, {})
-                            if legacy_attendance:
-                                attendance = legacy_attendance
-                                try:
-                                    await events_collection.update_one(
-                                        {"_id": event["_id"]},
-                                        {"$set": {f"attendance.{exact_date}": legacy_attendance}}
-                                    )
-                                except Exception as migrate_error:
-                                    print(f"Legacy attendance migration skipped: {migrate_error}")
+                    if attendance and exact_date not in attendance_data:
+                        try:
+                            await events_collection.update_one(
+                                {"_id": event["_id"]},
+                                {"$set": {f"attendance.{exact_date}": attendance}}
+                            )
+                        except Exception as migrate_error:
+                            print(f"Legacy attendance migration skipped: {migrate_error}")
 
                     if not attendance:
                         event_status = "incomplete"
@@ -2819,12 +2836,17 @@ async def get_other_events(
                             days_list = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
                             actual_day_value = days_list[instance_date.weekday()]
 
-                            attendance_data = event.get("attendance", {})
-                            if not isinstance(attendance_data, dict):
-                                attendance_data = {}
-                            date_attendance = attendance_data.get(exact_date_str, {})
-                            if not isinstance(date_attendance, dict):
-                                date_attendance = {}
+                            attendance_data = event.get("attendance", {}) or {}
+                            date_attendance = get_attendance_by_date(attendance_data, exact_date_str)
+
+                            if date_attendance and exact_date_str not in attendance_data:
+                                try:
+                                    await events_collection.update_one(
+                                        {"_id": event["_id"]},
+                                        {"$set": {f"attendance.{exact_date_str}": date_attendance}}
+                                    )
+                                except Exception as migrate_error:
+                                    print(f"Legacy attendance migration skipped: {migrate_error}")
 
                             original_date_str = None
                             event_date_field = event.get("date") or event.get("Date Of Event") or event.get("eventDate")
@@ -4256,9 +4278,11 @@ def get_actual_event_status(event: dict, target_date: date) -> str:
         print(f"Marked as 'did_not_meet'")
         return "did_not_meet"
    
-    if "attendance" in event and exact_date_str in event["attendance"]:
-        date_data = event["attendance"][exact_date_str] 
-        date_status = date_data.get("status", "incomplete")
+    if "attendance" in event:
+        attendance_data = event.get("attendance", {}) or {}
+        date_data = get_attendance_by_date(attendance_data, exact_date_str)
+        if date_data:
+            date_status = date_data.get("status", "incomplete")
        
         print(f"Found date data - Status: {date_status}")  
        
@@ -5299,7 +5323,7 @@ async def cleanup_duplicate_cells(current_user: dict = Depends(get_current_user)
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
    
-    # Find duplicates and keep only the oldest one
+    # Find duplicate cells and keep the newest document
     pipeline = [
         {"$match": {"Event Type": "Cells"}},
         {
@@ -5320,12 +5344,17 @@ async def cleanup_duplicate_cells(current_user: dict = Depends(get_current_user)
    
     deleted_count = 0
     for dup in duplicates:
-        # Keep first, delete rest
-        ids_to_delete = dup["docs"][1:]
-        result = await events_collection.delete_many({
-            "_id": {"$in": ids_to_delete}
-        })
-        deleted_count += result.deleted_count
+        docs = await events_collection.find(
+            {"_id": {"$in": dup["docs"]}}
+        ).sort([("updated_at", -1), ("Date Created", -1)]).to_list(length=None)
+
+        if not docs:
+            continue
+
+        ids_to_delete = [doc["_id"] for doc in docs[1:]]
+        if ids_to_delete:
+            result = await events_collection.delete_many({"_id": {"$in": ids_to_delete}})
+            deleted_count += result.deleted_count
    
     return {"message": f"Deleted {deleted_count} duplicate cells"}
    
@@ -6658,20 +6687,7 @@ async def get_cell_events_optimized(
                         continue
                      
                     exact_date_str = instance_date.isoformat()
-                    
-                    exact_date_str = instance_date.isoformat()
-                    week_attendance = attendance_data.get(exact_date_str, {})
-                    
-                    if not week_attendance:
-                        for key, value in attendance_data.items():
-                            if isinstance(value, dict):
-                                if value.get("event_date_exact") == exact_date_str:
-                                    week_attendance = value
-                                    break
-                                event_date_iso = value.get("event_date_iso")
-                                if event_date_iso and exact_date_str in event_date_iso:
-                                    week_attendance = value
-                                    break
+                    week_attendance = get_attendance_by_date(attendance_data, exact_date_str)
                     
                     if not week_attendance or not isinstance(week_attendance, dict):
                         cell_status = "incomplete"
@@ -7231,8 +7247,8 @@ async def get_persistent_attendees(
 
         persistent_attendees = event.get("persistent_attendees", [])
 
-        attendance_data   = event.get("attendance", {})
-        date_attendance   = attendance_data.get(exact_date_str, {})
+        attendance_data   = event.get("attendance", {}) or {}
+        date_attendance   = get_attendance_by_date(attendance_data, exact_date_str)
 
         if date_attendance:
             # This date has a submitted record — use it directly.
@@ -8987,7 +9003,7 @@ async def search_people(
 async def create_person(
     person_data: dict = Body(...),
     current_user: dict = Depends(get_current_user)
-):
+): 
     try:
         org_id = current_user.get("org_id") or (
             current_user.get("Organization", "").lower().replace(" ", "-")
