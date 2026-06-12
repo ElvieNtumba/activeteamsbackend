@@ -1,6 +1,7 @@
 
 import os
-import jwt
+from jose import JWTError, jwt
+from jose.exceptions import ExpiredSignatureError
 from datetime import datetime, timedelta, date, timezone
 import time
 from bson import ObjectId
@@ -151,9 +152,9 @@ async def authenticate(authorization: str = Header(...)):
             options={"verify_aud": False}
         )
         return decoded
-    except jwt.ExpiredSignatureError:
+    except ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError as e:
+    except JWTError as e:
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
 def get_database_client():
