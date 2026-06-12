@@ -33,7 +33,11 @@ from supreme_admin import router as supreme_admin_router
 from people import router as people_router
 app = FastAPI()
 
-import pandas as pd
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+    logging.warning("pandas not available; related endpoints may be disabled")
 import io
 
 app.add_middleware(
@@ -1817,7 +1821,7 @@ def generate_current_week_instances(event: dict) -> list:
                 "eventLeaderName": event.get("Leader") or event.get("eventLeaderName", ""),
                 "eventLeaderEmail": event.get("eventLeaderEmail") or event.get("Email", ""),
                 "leader1": event.get("leader1", ""),
-                "leader12": event.get("Leader @12") or event.get("Leader at 12") or event.get("leader12", ""),
+                "leader12": event.get("Leader @12") or event.get("leader12", ""),
                 "day": day_name,
                 "date": instance_date_iso,
                 "display_date": current_date.strftime("%d - %m - %Y"),
@@ -2059,10 +2063,34 @@ async def create_event(event: EventCreate, current_user: dict = Depends(get_curr
             event_data.setdefault("leader1728", "")
             event_data.setdefault("persistent_attendees", [])
 
-            # Accept frontend autocomplete leader IDs as safe strings for event storage
-            for leader_field in ["leader1", "leader12", "leader144", "leader1728"]:
-                if leader_field in event_data and event_data[leader_field] is not None:
-                    event_data[leader_field] = str(event_data[leader_field])
+            leader_name_variants = {
+                "leader1":    ["leader1Name",    "leaderAt1Name"],
+                "leader12":   ["leader12Name",   "leaderAt12Name"],
+                "leader144":  ["leader144Name",  "leaderAt144Name"],
+                "leader1728": ["leader1728Name", "leaderAt1728Name"],
+            }
+            
+            for leader_field, name_fields in leader_name_variants.items():
+                # Try to find a non-empty name from the Name fields first
+                resolved_name = ""
+                for name_field in name_fields:
+                    val = str(event_data.get(name_field) or "").strip()
+                    if val:
+                        resolved_name = val
+                        break
+
+                # If still empty, check the raw field — but reject it if it looks like a MongoDB ObjectId
+                if not resolved_name:
+                    raw = str(event_data.get(leader_field) or "").strip()
+                    if raw and not re.match(r'^[0-9a-fA-F]{24}$', raw):
+                        resolved_name = raw
+
+                # Write the resolved name to all four variants so any field access works
+                suffix = leader_field.replace("leader", "")  # "1", "12", "144", "1728"
+                event_data[leader_field]                  = resolved_name
+                event_data[f"{leader_field}Name"]         = resolved_name
+                event_data[f"leaderAt{suffix}"]           = resolved_name
+                event_data[f"leaderAt{suffix}Name"]       = resolved_name
 
         if event_data.get("isTicketed") and event_data.get("priceTiers"):
             event_data["priceTiers"] = [
