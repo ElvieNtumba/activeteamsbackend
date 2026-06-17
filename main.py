@@ -2069,7 +2069,7 @@ async def create_event(event: EventCreate, current_user: dict = Depends(get_curr
                 "leader144":  ["leader144Name",  "leaderAt144Name"],
                 "leader1728": ["leader1728Name", "leaderAt1728Name"],
             }
-            
+          
             for leader_field, name_fields in leader_name_variants.items():
                 # Try to find a non-empty name from the Name fields first
                 resolved_name = ""
@@ -2091,7 +2091,55 @@ async def create_event(event: EventCreate, current_user: dict = Depends(get_curr
                 event_data[f"{leader_field}Name"]         = resolved_name
                 event_data[f"leaderAt{suffix}"]           = resolved_name
                 event_data[f"leaderAt{suffix}Name"]       = resolved_name
+                
+                if event_data.get("hasPersonSteps"):
+                     # If leader12 is still empty, try to resolve from event leader's LeaderPath
+                     if not event_data.get("leader12") and event_data.get("eventLeaderEmail"):
+                         leader_email = event_data.get("eventLeaderEmail", "").strip().lower()
+                         leader_person = await people_collection.find_one(
+                             {"Email": {"$regex": f"^{re.escape(leader_email)}$", "$options": "i"}},
+                             {"_id": 1, "LeaderPath": 1}
+                         )
+                         if leader_person and leader_person.get("LeaderPath"):
+                             path = leader_person["LeaderPath"]
+                             # LeaderPath is root-first: index 0 = level1, index 1 = level12
+                             if len(path) > 1:
+                                 leader12_id = path[1]  # level 12
+                                 try:
+                                     leader12_doc = await people_collection.find_one(
+                                         {"_id": ObjectId(str(leader12_id)) if not isinstance(leader12_id, ObjectId) else leader12_id},
+                                         {"Name": 1, "Surname": 1}
+                                     )
+                                     if leader12_doc:
+                                         leader12_name = f"{leader12_doc.get('Name', '')} {leader12_doc.get('Surname', '')}".strip()
+                                         event_data["leader12"] = leader12_name
+                                         event_data["leader12Name"] = leader12_name
+                                         event_data["leaderAt12"] = leader12_name
+                                         event_data["leaderAt12Name"] = leader12_name
+                                         event_data["Leader @12"] = leader12_name
+                                         event_data["Leader at 12"] = leader12_name
+                                         print(f"Auto-resolved leader12 from LeaderPath: {leader12_name}")
+                                 except Exception as e:
+                                     print(f"Could not resolve leader12 from path: {e}")
 
+                             # Also ensure leader1 from path index 0
+                             if len(path) > 0 and not event_data.get("leader1"):
+                                 leader1_id = path[0]
+                                 try:
+                                     leader1_doc = await people_collection.find_one(
+                                         {"_id": ObjectId(str(leader1_id)) if not isinstance(leader1_id, ObjectId) else leader1_id},
+                                         {"Name": 1, "Surname": 1}
+                                     )
+                                     if leader1_doc:
+                                         leader1_name = f"{leader1_doc.get('Name', '')} {leader1_doc.get('Surname', '')}".strip()
+                                         event_data["leader1"] = leader1_name
+                                         event_data["leader1Name"] = leader1_name
+                                         event_data["leaderAt1"] = leader1_name
+                                         event_data["leaderAt1Name"] = leader1_name
+                                         print(f"Auto-resolved leader1 from LeaderPath: {leader1_name}")
+                                 except Exception as e:
+                                     print(f"Could not resolve leader1 from path: {e}")
+            
         if event_data.get("isTicketed") and event_data.get("priceTiers"):
             event_data["priceTiers"] = [
                 {k: (float(v) if k == "price" else v) for k, v in tier.items()}
@@ -6772,6 +6820,27 @@ async def get_cell_events_optimized(
                         continue
                     
                     is_overdue = instance_date < today and cell_status == "incomplete"
+                    
+                    def _resolve_name_field(val: str) -> str:
+                        """Return val only if it looks like a human name, not a Mongo ObjectId."""
+                        if not val:
+                            return ""
+                        if re.match(r'^[0-9a-fA-F]{24}$', str(val).strip()):
+                            return ""
+                        return str(val).strip()
+
+                    leaderAt12 = (
+                        _resolve_name_field(event.get("Leader at 12")) or
+                        _resolve_name_field(event.get("Leader @12")) or
+                        _resolve_name_field(event.get("leader12")) or
+                        _resolve_name_field(event.get("leader12Name")) or
+                        _resolve_name_field(event.get("leaderAt12Name")) or
+                        _resolve_name_field(event.get("Leader12")) or
+                        _resolve_name_field(event.get("LeaderAt12")) or
+                        _resolve_name_field(event.get("leader at 12")) or
+                        _resolve_name_field(event.get("leader @12")) or
+                        ""
+                    )
                     
                     instance = {
                         "_id": f"{cell['_id']}_{exact_date_str}",
