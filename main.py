@@ -43,7 +43,8 @@ app.add_middleware(
     allow_origins=[
         "https://teams.theactivechurch.org",
         "http://localhost:8000",
-        "http://localhost:5173",  
+        "http://localhost:5173",
+        "http://localhost:5174",  
         "https://new-active-teams.netlify.app",
         "https://activeteams.netlify.app",
         "https://activeteamsbackend2.0.onrender.com"
