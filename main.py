@@ -1,8 +1,10 @@
 import os
+from jose import JWTError, jwt
+from jose.exceptions import ExpiredSignatureError
 from datetime import datetime, timedelta, date, timezone
 import time
 import re
-from fastapi import Body, FastAPI, HTTPException, Query, Path, Request ,  Depends, BackgroundTasks, File, UploadFile
+from fastapi import Body, FastAPI, HTTPException, Query, Path, Request ,  Depends, BackgroundTasks, File, UploadFile, Header
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from auth.models import EventCreate,DecisionType, UserProfile, ConsolidationCreate, UserProfileUpdate, CheckIn, UncaptureRequest, UserCreate,UserCreater,  UserLogin, CellEventCreate, AddMemberNamesRequest, RemoveMemberRequest, RefreshTokenRequest, ForgotPasswordRequest, ResetPasswordRequest, TaskModel,TaskTypeUpdate, PersonCreate, EventTypeCreate, UserListResponse, UserList, MessageResponse, PermissionUpdate, RoleUpdate, AttendanceSubmission, TaskUpdate, EventUpdate ,TaskTypeIn ,TaskTypeOut , LeaderStatusResponse, UserProfile,  OrganizationCreate, OrganizationUpdate, OrganizationResponse, OrganizationList, PeopleResponse, PeopleList
@@ -46,13 +48,15 @@ app = start_application()
 
 import pandas as pd
 import io
+SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://teams.theactivechurch.org",
         "http://localhost:8000",
-        "http://localhost:5173",  
+        "http://localhost:5173",
+        "http://localhost:5174",  
         "https://new-active-teams.netlify.app",
         "https://activeteams.netlify.app",
         "https://activeteamsbackend2.0.onrender.com"
@@ -151,6 +155,20 @@ def serialize_doc(doc: dict) -> dict:
 DB_NAME = os.getenv("DB_NAME", "active-teams-db")
 # REMOVED DUPLICATE: consolidations_collection already imported from database on line 14
 
+async def authenticate(authorization: str = Header(...)):
+    token = authorization.replace("Bearer ", "").strip()
+    try:
+        decoded = jwt.decode(
+            token,
+            SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            options={"verify_aud": False}
+        )
+        return decoded
+    except ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except JWTError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
 def get_database_client():
     """Return a Supabase client instance for low-level access."""
@@ -5202,7 +5220,7 @@ async def migrate_persistent_attendees(current_user: dict = Depends(get_current_
 
 
 @app.get("/check-leader-status", response_model=LeaderStatusResponse)
-async def check_leader_status(current_user: dict = Depends(get_current_user)):
+async def check_leader_status(current_user: dict = Depends(authenticate)):
     """Check if user is a leader OR has a cell"""
     try:
         user_email = current_user.get("email")
@@ -7819,7 +7837,111 @@ async def uncapture_person(data: UncaptureRequest):
 
 # --- PROFILE PICTURE ENDPOINTS ---
 @app.get("/profile/{user_id}", response_model=UserProfile)
-async def get_profile(user_id: str, current_user: dict = Depends(get_current_user)):
+async def get_profile(user_id: str, current_user: dict = Depends(authenticate)):
+    try:
+        token_user_id = current_user.get("user_id") or current_user.get("_id")
+        if not token_user_id:
+            raise HTTPException(status_code=401, detail="Invalid user ID in token")
+        if str(token_user_id) != str(user_id):
+            raise HTTPException(status_code=403, detail="Not authorized to access this profile")
+        if not ObjectId.is_valid(user_id):
+            raise HTTPException(status_code=400, detail=f"Invalid user ID format: {user_id}")
+
+        user = await users_collection.find_one({"_id": ObjectId(user_id)})
+        if not user:
+            raise HTTPException(status_code=404, detail=f"User not found with ID: {user_id}")
+
+        user_email = user.get("email", "")
+
+        # ── Always look up the people doc — it has the authoritative LeaderPath ──
+        person = None
+        if user_email:
+            person = await people_collection.find_one(
+                {"Email": {"$regex": f"^{re.escape(user_email)}$", "$options": "i"}}
+            )
+
+        # ── Resolve leader path: prefer people doc, fall back to users doc ──────
+        raw_path = []
+        if person and person.get("LeaderPath"):
+            raw_path = person["LeaderPath"]
+        elif user.get("LeaderPath"):
+            raw_path = user["LeaderPath"]
+
+        # Normalise to ObjectId list
+        leader_path_oids = []
+        for entry in raw_path:
+            try:
+                leader_path_oids.append(
+                    entry if isinstance(entry, ObjectId) else ObjectId(str(entry))
+                )
+            except Exception:
+                pass
+
+        # ── Resolve the three leader levels from LeaderPath ─────────────────────
+        # LeaderPath is root-first: [root(level1), level12, level144, ...]
+        async def _resolve_leader(oid: ObjectId) -> Optional[dict]:
+            if not oid:
+                return None
+            doc = await people_collection.find_one(
+                {"_id": oid},
+                {"_id": 1, "Name": 1, "Surname": 1, "Email": 1, "Number": 1}
+            )
+            if not doc:
+                return None
+            return {
+                "id": str(doc["_id"]),
+                "name": doc.get("Name", ""),
+                "surname": doc.get("Surname", ""),
+                "email": doc.get("Email", ""),
+                "phone_number": doc.get("Number", "")
+            }
+
+        leader_at_1   = await _resolve_leader(leader_path_oids[0]) if len(leader_path_oids) > 0 else None
+        leader_at_12  = await _resolve_leader(leader_path_oids[1]) if len(leader_path_oids) > 1 else None
+        leader_at_144 = await _resolve_leader(leader_path_oids[2]) if len(leader_path_oids) > 2 else None
+
+        # ── Resolve InvitedBy display name ──────────────────────────────────────
+        # Use people doc's InvitedBy string, or derive from the direct leader
+        invited_by = ""
+        if person:
+            invited_by = person.get("InvitedBy", "") or user.get("invited_by", "")
+        else:
+            invited_by = user.get("invited_by", "")
+
+        # If invited_by is still empty but we have a direct leader, use their name
+        if not invited_by and leader_at_1:
+            invited_by = f"{leader_at_1['name']} {leader_at_1['surname']}".strip()
+
+        organization = user.get("Organization") or user.get("organization", "")
+        leader_path_strs = [str(o) for o in leader_path_oids]
+
+        return {
+            "id": str(user["_id"]),
+            "name": user.get("name", ""),
+            "surname": user.get("surname", ""),
+            "date_of_birth": user.get("date_of_birth", ""),
+            "home_address": user.get("home_address", ""),
+            "invited_by": invited_by,
+            "phone_number": user.get("phone_number", ""),
+            "email": user.get("email", ""),
+            "gender": user.get("gender", ""),
+            "role": user.get("role", "user"),
+            "profile_picture": user.get("profile_picture", ""),
+            "organization": organization,
+            "leader_path": leader_path_strs,
+            "leaders": {
+                "leaderAt1":   leader_at_1,
+                "leaderAt12":  leader_at_12,
+                "leaderAt144": leader_at_144,
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Profile fetch error: {str(e)}")
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to fetch profile: {str(e)}")
     try:
         token_user_id = current_user.get("user_id") or current_user.get("_id")
         if not token_user_id:
@@ -8015,7 +8137,7 @@ async def get_profile(user_id: str, current_user: dict = Depends(get_current_use
 async def update_profile(
     user_id: str,
     profile_update: UserProfileUpdate,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(authenticate)
 ):
     try:
         token_user_id = current_user.get("user_id") or current_user.get("_id")
@@ -14852,4 +14974,4 @@ async def preview_spreadsheet_columns(
         "column_mapping": column_mapping,
         "ignored_columns": [c["original"] for c in column_mapping if c["status"] == "ignored"],
         "sample_rows":    sample,
-    }
+    }  
