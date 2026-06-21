@@ -1,29 +1,24 @@
-import asyncio
 import os
-from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
+from supabase_helpers.supabase_client import supabase
 
 load_dotenv()
 
-MONGO_URI = "mongodb+srv://activeteams:helloactiveteams@active-teams.ykghvqr.mongodb.net/"
+DB_NAME = os.getenv("DB_NAME", "active-teams-db")
 
-async def check_db(db_name):
-    client = AsyncIOMotorClient(MONGO_URI)
-    db = client[db_name]
-    count = await db['organizations'].count_documents({})
-    colls = await db.list_collection_names()
-    print(f"--- DB: {db_name} ---")
-    print(f"Collections: {colls}")
-    print(f"Organizations Count: {count}")
-    if count > 0:
-        cursor = db['organizations'].find({}, {"name": 1})
-        orgs = await cursor.to_list(length=10)
-        print(f"Sample Orgs: {[o['name'] for o in orgs]}")
-    client.close()
+async def check_db(table_name):
+    print(f"--- Table: {table_name} ---")
+    result = supabase.table(table_name).select("id", count="exact").execute()
+    count = getattr(result, "count", None)
+    print(f"Count: {count}")
+    if count and count > 0:
+        sample = result.data[:10] if getattr(result, "data", None) else []
+        print(f"Sample rows: {sample}")
 
 async def main():
-    await check_db("active-teams-db")
-    await check_db("test-data-active-teams")
+    await check_db("organizations")
+    await check_db("users")
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())

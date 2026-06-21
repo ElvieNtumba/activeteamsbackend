@@ -7,9 +7,7 @@ from jose import JWTError, jwt
 from jose.exceptions import ExpiredSignatureError
 from fastapi import HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from database import users_collection
-from bson import ObjectId
-from datetime import datetime
+from database import users_collection, ObjectId
 
 # ==============================
 # CONFIG
@@ -260,7 +258,6 @@ def sanitize_document(doc: dict) -> dict:
     """
     Recursively convert ObjectId and other non-serializable fields.
     """
-    from bson import ObjectId
 
     def sanitize(value):
         if isinstance(value, ObjectId):
