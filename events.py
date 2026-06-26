@@ -267,25 +267,7 @@ async def create_event(event: EventCreate, current_user: dict = Depends(get_curr
             raise e
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/event-types")
-async def get_event_types(current_user: dict = Depends(get_current_user)):
-    """
-    Fetches event types for the current user's organization from Supabase.
-    """
-    try:
-        # test = supabase.table("events").select("*").limit(1).execute()
-        # print(f"Supabase test query result: {test}")
 
-        org_id = current_user.get("org_id") 
-      
-        print(f"GET EVENT TYPES — user: {current_user.get('email')} | org_id: {org_id}")
-
-        event_types = supabase.table("event_types").select("*").eq("org_id", org_id).execute().data
-        return event_types
-
-    except Exception as e:
-        print(f"Error fetching event types: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
     
 
 async def get_top_leader_dynamic(gender: str, org_id: str = "active-teams") -> str:
@@ -333,29 +315,8 @@ async def get_cell_events(
     must_paginate: Optional[bool] = Query(True)
 ):
     try:
-# Define your parameters
-        params = {
-            "p_event_type": "Cells",
-            "p_status": "Complete",
-            "p_day": "Tuesday"
-        }
 
-# Call the RPC method with the arguments
-        cell_events = supabase.rpc("get_unique_events", params).execute().data
-        # print(f"Supabase query result for cell events: {cells}")
-
-        # # return cells
-        # org_id = (
-        #     current_user.get("org_id") or
-        #     (current_user.get("organization", "").lower().replace(" ", "-")) or
-        #     "active-teams"
-        # )
-        # org_id = ORG_ID_MAP.get(org_id.lower(), org_id)
-        # organization = current_user.get("Organization") or current_user.get("organization", "")
-
-        # org_config = await org_config_collection.find_one({"_id": org_id})
-        # recurring_type = org_config.get("recurring_event_type", "Cells") if org_config else "Cells"
-
+        # 1 - getting currenr user details
         user_email = current_user.get("email", "")
         role = current_user.get("role", "").lower().strip()
         is_actual_leader_at_12 = (
@@ -364,15 +325,6 @@ async def get_cell_events(
             "leader at 12" in role or
             "leader@12" in role
         )
-
-        # if recurring_type.lower() != "cells":
-        #     return {
-        #         "events": [],
-        #         "total_events": 0,
-        #         "total_pages": 1,
-        #         "current_page": 1,
-        #         "page_size": 25,
-        #     }
 
         user_name_from_frontend = f"{firstName or ''} {userSurname or ''}".strip()
 
@@ -402,313 +354,110 @@ async def get_cell_events(
 
         print(f"User name resolved as: {user_name}")
 
-        # query = {
-        #     "$and": [
-        #         {
-        #             "$or": [
-        #                 {"Event Type": {"$regex": "^Cells$", "$options": "i"}},
-        #                 {"eventType": {"$regex": "^Cells$", "$options": "i"}},
-        #                 {"eventTypeName": {"$regex": "^Cells$", "$options": "i"}},
-        #                 {"EventType": {"$regex": "^Cells$", "$options": "i"}},
-        #                 {"eventTypeId": "CELLS_BUILT_IN"},
-        #                 {"hasPersonSteps": True},
-        #             ]
-        #         },
-        #         {"isEventType": {"$ne": True}},
-        #         {
-        #             "$or": [
-        #                 {"org_id": org_id},
-        #                 {"Organization": {"$regex": re.escape(organization), "$options": "i"}}
-        #             ]
-        #         },
-        #         {
-        #             "$or": [
-        #                 {"is_active": True},
-        #                 {"is_active": {"$exists": False}}
-        #             ]
-        #         },
-        #     ]
-        # }
 
-        # if search and search.strip():
-        #     search_term = search.strip()
-        #     query["$and"].append({
-        #         "$or": [
-        #             {"Event Name": {"$regex": search_term, "$options": "i"}},
-        #             {"eventName": {"$regex": search_term, "$options": "i"}},
-        #             {"Leader": {"$regex": search_term, "$options": "i"}},
-        #             {"Email": {"$regex": search_term, "$options": "i"}},
-        #             {"Leader at 12": {"$regex": search_term, "$options": "i"}},
-        #             {"Leader @12": {"$regex": search_term, "$options": "i"}},
-        #         ]
-        #     })
 
-        # def create_name_conditions(target_name, fields):
-        #     conditions = []
-        #     if not target_name:
-        #         return conditions
-        #     clean_name = target_name.strip()
-        #     for field in fields:
-        #         conditions.append({field: {"$regex": f"^{re.escape(clean_name)}$", "$options": "i"}})
-        #         conditions.append({field: {"$regex": re.escape(clean_name), "$options": "i"}})
-        #         title_name = clean_name.title()
-        #         conditions.append({field: {"$regex": f"^{re.escape(title_name)}$", "$options": "i"}})
-        #         name_parts = clean_name.split()
-        #         if len(name_parts) > 0:
-        #             first_name = name_parts[0].strip()
-        #             conditions.append({field: {"$regex": re.escape(first_name), "$options": "i"}})
-        #     return conditions
+        # 2 - getting day we fetching for
+        today_date = datetime.now()
 
-        # if role == "admin":
-        #     if personal or show_personal_cells:
-        #         name_fields = ["Leader", "eventLeader", "eventLeaderName", "EventLeaderName"]
-        #         name_conditions = create_name_conditions(user_name, name_fields)
-        #         email_fields = ["eventLeaderEmail", "EventLeaderEmail", "Email"]
-        #         email_conditions = create_name_conditions(user_email, email_fields)
-        #         query["$and"].append({"$or": name_conditions + email_conditions})
+        today_day = today_date.strftime('%A')
+     
 
-        # elif is_actual_leader_at_12 and leader_at_12_view:
-        #     want_personal_view = (show_personal_cells or personal)
-        #     want_disciples_view = (show_all_authorized or include_subordinate_cells)
+        #parameters used when fetching the cells
+        all_cells_params = {
+            "p_event_type": "Cells",
+            "p_day": today_day
+        }
 
-        #     if want_personal_view and not want_disciples_view:
-        #         name_fields = ["Leader", "eventLeader", "eventLeaderName", "EventLeaderName"]
-        #         name_conditions = create_name_conditions(user_name, name_fields)
-        #         email_fields = ["eventLeaderEmail", "EventLeaderEmail", "Email"]
-        #         email_conditions = create_name_conditions(user_email, email_fields)
-        #         query["$and"].append({"$or": name_conditions + email_conditions})
+        personal_cells_params = {
+            "p_event_type": "Cells",
+            "p_status": status,
+            "p_day": today_day,
+            "p_leader_email": user_email
+        }
 
-        #     elif want_disciples_view and not want_personal_view:
-        #         conditions = []
-        #         if user_person_id:
-        #             conditions.append({"LeaderPath": user_person_id})
-        #         leader_at_12_fields = [
-        #             "Leader at 12", "Leader @12", "leader12",
-        #             "Leader12", "LeaderAt12", "leader at 12", "leader @12"
-        #         ]
-        #         for field in leader_at_12_fields:
-        #             conditions.append({field: {"$regex": f"^{re.escape(user_name)}$", "$options": "i"}})
-        #             conditions.append({field: {"$regex": re.escape(user_name), "$options": "i"}})
-        #         print(f"Disciples query conditions count: {len(conditions)}")
-        #         if conditions:
-        #             query["$and"].append({"$or": conditions})
-        #         else:
-        #             query["$and"].append({"_id": "nonexistent_id"})
+        disciples_cells_params = {
+            
+        }
 
-        #     else:
-        #         name_fields = ["Leader", "eventLeader", "eventLeaderName", "EventLeaderName"]
-        #         name_conditions = create_name_conditions(user_name, name_fields)
-        #         email_fields = ["eventLeaderEmail", "EventLeaderEmail", "Email"]
-        #         email_conditions = create_name_conditions(user_email, email_fields)
-        #         query["$and"].append({"$or": name_conditions + email_conditions})
 
-        # elif role == "leader144":
-        #     name_fields = ["Leader", "eventLeader", "eventLeaderName", "EventLeaderName",
-        #                    "leader144", "Leader at 144", "Leader @144"]
-        #     name_conditions = create_name_conditions(user_name, name_fields)
-        #     email_fields = ["eventLeaderEmail", "EventLeaderEmail", "Email"]
-        #     email_conditions = create_name_conditions(user_email, email_fields)
-        #     leader_path_condition = []
-        #     if user_person_id:
-        #         leader_path_condition = [{"leaderLeaderPath": user_person_id}]
-        #     query["$and"].append({"$or": name_conditions + email_conditions + leader_path_condition})
+        cell_events=[]
 
-        # elif role in ["user", "registrant", "leader"]:
-        #     conditions = []
-        #     if user_name:
-        #         clean_name = user_name.strip()
-        #         for field in ["Leader", "eventLeaderName", "EventLeaderName"]:
-        #             conditions.append({field: {"$regex": f"^{re.escape(clean_name)}$", "$options": "i"}})
-        #     if user_email:
-        #         clean_email = user_email.strip().lower()
-        #         for field in ["eventLeaderEmail", "EventLeaderEmail", "Email"]:
-        #             conditions.append({field: {"$regex": f"^{re.escape(clean_email)}$", "$options": "i"}})
-        #     if user_person_id:
-        #         conditions.append({"leaderLeaderPath": user_person_id})
-        #     if conditions:
-        #         query["$and"].append({"$or": conditions})
-        #     else:
-        #         query["$and"].append({"_id": "nonexistent_id"})
+        
 
-        # print(f"Final query for cells: {query}")
+        ref = datetime.strptime(today_date.strftime("%Y-%m-%d"), "%Y-%m-%d").date()
+        three_weeks_ago = ref - timedelta(weeks=3)
 
-        # pipeline = [
-        #     {"$match": query},
-        #     {
-        #         "$group": {
-        #             "_id": {
-        #                 "event_name": {"$ifNull": ["$Event Name", "$eventName", "$EventName"]},
-        #                 "leader_email": {"$ifNull": ["$eventLeaderEmail", "$EventLeaderEmail", "$Email"]},
-        #                 "day": {"$ifNull": ["$Day", "$day"]}
-        #             },
-        #             "doc": {"$first": "$$ROOT"}
-        #         }
-        #     },
-        #     {"$replaceRoot": {"newRoot": "$doc"}},
-        #     {"$sort": {"Day": 1, "Leader": 1}}
-        # ]
+        start_str = three_weeks_ago.strftime("%Y-%m-%d")
+        end_str = ref.strftime("%Y-%m-%d")
 
-        # events = await events_collection.aggregate(pipeline).to_list(length=None)
+        events=[]
+        event_sessions=[]
+        if (is_actual_leader_at_12 or role =="admin" and personal == False):
+            event_sessions = supabase.table("event_sessions").select("*").gte("session_date", start_str).lte("session_date", end_str).execute()
+            event_sessions = event_sessions.data
+            events = supabase.rpc("get_unique_events", all_cells_params).execute().data
 
-        # sa_timezone = pytz.timezone("Africa/Johannesburg")
-        # today = datetime.now(sa_timezone).date()
+        elif personal == True:
+            cell_events = supabase.rpc("get_personal_unique_events", personal_cells_params).execute().data
+        
+        
+        for session in event_sessions:
+            for event in events:
+                if session.get("event_id") == event.get("event_id"):
+                    attendees = supabase.table("event_session_attendees").select("*").eq("session_id", session.get("session_id")).execute().data
+                    # price_tiers = supabase.table("event_price_tiers").select("*").eq("event_id", event.get("event_id")).execute().data
+                    cell_events.append({**event, **session,"persistent_attendees":attendees})
 
-        # try:
-        #     start_date_obj = datetime.strptime(start_date if start_date else "2025-11-30", "%Y-%m-%d").date()
-        # except:
-        #     start_date_obj = datetime.strptime("2025-11-30", "%Y-%m-%d").date()
-
-        # day_mapping = {
-        #     'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
-        #     'friday': 4, 'saturday': 5, 'sunday': 6
-        # }
-
-        # cell_instances = []
-
-        # for event in events:
-        #     try:
-        #         day_name = str(event.get("Day") or event.get("day") or "").strip().lower()
-        #         if not day_name or day_name not in day_mapping:
-        #             continue
-
-        #         target_weekday = day_mapping.get(day_name)
-        #         if target_weekday is None:
-        #             continue
-
-        #         max_weeks = 1 if status == "incomplete" else 4
-
-        #         days_since_monday = today.weekday()
-        #         week_start = today - timedelta(days=days_since_monday)
-        #         current_week_instance = week_start + timedelta(days=target_weekday)
-
-        #         for week_back in range(0, max_weeks):
-        #             instance_date = current_week_instance - timedelta(weeks=week_back)
-
-        #             if instance_date > today:
-        #                 continue
-        #             if instance_date < start_date_obj:
-        #                 continue
-
-        #             exact_date = instance_date.isoformat()
-        #             attendance_data = event.get("attendance", {})
-        #             attendance = attendance_data.get(exact_date, {})
-
-        #             if not attendance:
-        #                 for key, value in attendance_data.items():
-        #                     if isinstance(value, dict):
-        #                         if value.get("event_date_exact") == exact_date:
-        #                             attendance = value
-        #                             break
-        #                         event_date_iso = value.get("event_date_iso")
-        #                         if event_date_iso and exact_date in event_date_iso:
-        #                             attendance = value
-        #                             break
-        #                 if not attendance:
-        #                     legacy_week_key = instance_date.strftime("%G-W%V")
-        #                     legacy_attendance = attendance_data.get(legacy_week_key, {})
-        #                     if legacy_attendance:
-        #                         attendance = legacy_attendance
-        #                         try:
-        #                             await events_collection.update_one(
-        #                                 {"_id": event["_id"]},
-        #                                 {"$set": {f"attendance.{exact_date}": legacy_attendance}}
-        #                             )
-        #                         except Exception as migrate_error:
-        #                             print(f"Legacy attendance migration skipped: {migrate_error}")
-
-        #             if not attendance:
-        #                 event_status = "incomplete"
-        #                 attendees = []
-        #                 did_not_meet = False
-        #             else:
-        #                 att_status = attendance.get("status", "").lower()
-        #                 attendees = attendance.get("attendees", [])
-        #                 if att_status == "did_not_meet":
-        #                     event_status = "did_not_meet"
-        #                     did_not_meet = True
-        #                 elif att_status == "complete" or len(attendees) > 0:
-        #                     event_status = "complete"
-        #                     did_not_meet = False
-        #                 else:
-        #                     event_status = "incomplete"
-        #                     did_not_meet = False
-
-        #             if status and status != 'all' and event_status != status:
-        #                 continue
-
-        #             is_overdue = instance_date < today and event_status == "incomplete"
-
-        #             leaderAt1 = event.get("leader1") or event.get("Leader @1") or event.get("Leader at 1", "")
-
-        #             if not leaderAt1:
-        #                 leaderPipeline = [
-        #                     {"$project": {"Gender": 1, "fullName": {"$concat": ["$Name", " ", "$Surname"]}}},
-        #                     {"$match": {"fullName": event.get("Leader") or event.get("eventLeaderName") or event.get("EventLeaderName", "")}},
-        #                     {"$limit": 1}
-        #                 ]
-        #                 peopleFullnames = await people_collection.aggregate(leaderPipeline).to_list(length=None)
-        #                 if peopleFullnames and len(peopleFullnames) > 0:
-        #                     eventLeader = peopleFullnames[0]
-        #                     if eventLeader:
-        #                         gender = eventLeader.get("Gender", "")
-        #                         leaderAt1 = await get_top_leader_dynamic(gender, org_id)
-
-        #             leaderAt12 = (
-        #                 event.get("Leader at 12") or
-        #                 event.get("Leader @12") or
-        #                 event.get("leader12") or
-        #                 event.get("Leader12") or
-        #                 event.get("LeaderAt12") or
-        #                 event.get("leader at 12") or
-        #                 event.get("leader @12") or
-        #                 ""
-        #             )
-
-        #             instance = {
-        #                 "_id": f"{event.get('_id')}_{exact_date}",
-        #                 "UUID": event.get("UUID", ""),
-        #                 "eventName": event.get("Event Name") or event.get("eventName") or event.get("EventName", ""),
-        #                 "eventType": "Cells",
-        #                 "eventLeaderName": event.get("Leader") or event.get("eventLeaderName") or event.get("EventLeaderName", ""),
-        #                 "eventLeaderEmail": event.get("eventLeaderEmail") or event.get("EventLeaderEmail") or event.get("Email", ""),
-        #                 "leader1": leaderAt1,
-        #                 "leader12": leaderAt12,
-        #                 "day": day_name.capitalize(),
-        #                 "date": exact_date,
-        #                 "display_date": instance_date.strftime("%d - %m - %Y"),
-        #                 "location": event.get("Location") or event.get("location", ""),
-        #                 "attendees": attendees,
-        #                 "persistent_attendees": event.get("persistent_attendees", []),
-        #                 "hasPersonSteps": True,
-        #                 "status": event_status,
-        #                 "Status": event_status.replace("_", " ").title(),
-        #                 "did_not_meet": did_not_meet,
-        #                 "_is_overdue": is_overdue,
-        #                 "is_recurring": True,
-        #                 "original_event_id": str(event.get("_id")),
-        #                 "attendance": attendance,
-        #                 "is_active": event.get("is_active", ""),
-        #             }
-        #             if event.get("time"):
-        #                 instance["time"] = event.get("time")
-        #             if event.get("Time"):
-        #                 instance["Time"] = event.get("Time")
-
-        #             cell_instances.append(instance)
-                
-        #     except Exception as e:
-        #         print(f"Error processing event {event.get('_id')}: {e}")
-        #         continue
         
         cells = []
         for i in cell_events:
+            [leaderat1,leaderAt12] = supabase.table("People").select() 
             cells.append({
+                "_id": f"{i.get('mongo_id')}_{i.get('session_date')}",
+                "UUID": i.get("event_id"),
+                "eventName": i.get("event_name"),
+                "eventType": i.get("event_type_name"),
+                "eventLeaderName": i.get("event_leader"),
+                "eventLeaderEmail": i.get("event_leader_email"),
+                "leader1": i.get("leader1", ""),  # Fallback to empty string if missing
+                "leader12": i.get("leader12", ""),
+                "day": i.get("recurring_day"),
+                "date": i.get("session_date"),
+                "display_date": "-".join(reversed(i.get("session_date", "").split("-"))) if i.get("session_date") else "", # Converts YYYY-MM-DD to DD-MM-YYYY
+                "location": i.get("location"),
+                "attendees": [],
+                "persistent_attendees": [
+                    {
+                        "id": p.get("mongo_person_id"),
+                        "name": p.get("full_name"),
+                        "fullName": p.get("full_name"),
+                        "email": p.get("email"),
+                        "phone": p.get("phone") if p.get("phone") is not None else "",
+                        "leader12": p.get("leader12", ""),
+                        "leader144": p.get("leader144", ""),
+                        "invitedBy": p.get("invited_by", ""),
+                        "isPersistent": p.get("is_persistent", True),
+                        "priceName": "",
+                        "price": 0,
+                        "ageGroup": "",
+                        "paymentMethod": "",
+                        "paid": 0,
+                        "paidAmount": 0,
+                        "owing": 0,
+                        "change": 0
+                    }
+                    for p in i.get("persistent_attendees", [])
+                ],
+                "hasPersonSteps": i.get("has_person_steps"),
                 "status": i.get("status"),
-                "recurring": i.get("recurring"),
-                "Event Name": i.get("event_name"),
-                "Event Leader Name": i.get("event_leader"),
-                "Event Leader Email": i.get("event_leader_email"),
-                "Leader1": i.get("leader1")
+                "Status": i.get("status", "").capitalize() if i.get("status") else "",
+                "did_not_meet": i.get("is_did_not_meet", False),
+                "_is_overdue": i.get("_is_overdue", True), # Inferred from the schema target
+                "is_recurring": i.get("is_recurring"),
+                "original_event_id": i.get("mongo_id"),
+                "attendance": {},
+                "is_active": i.get("is_active"),
+                "time": i.get("time", "07:20") # Fallback default if not explicitly provided
             })
 
         if must_paginate:
@@ -739,6 +488,164 @@ async def get_cell_events(
     except Exception as e:
         print(f"Error in /events/cells: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+async def create_cell_instances():
+    """
+    creates cell instances every week
+    """
+    try:
+        #getting all active cells
+        params = {
+            "p_event_type": "Cells"
+        }
+        events = supabase.rpc("get_all_unique_events", params).execute().data
+
+        #formulating current week's date
+        today_date = datetime.now()
+
+        week_indetifier = today_date.strftime("%Y-%m-%d") 
+
+        #week number helps with getting date for a specific day tha week
+        week_no_int = int(today_date.strftime("%U")) +1
+        year_int = int(today_date.strftime("%Y"))
+
+        #iso calendar week format
+        days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+        cell_instances = []
+        num_of_errors = []
+        for event in events:
+            #getting cell occurance day number
+            weekday = days.index(event.get("recurring_day")) + 1
+
+            
+            session_date = datetime.fromisocalendar(year_int, week_no_int, weekday).date().strftime("%Y-%m-%d")
+         
+            cell_event = {
+                "event_id": event.get("event_id"),
+                "session_date": session_date,
+                "week_identifier": week_indetifier,
+                "status":"incomplete",
+                "is_did_not_meet":False,
+                
+            }
+            cell_instances.append(cell_event)
+ 
+            new_instance = supabase.table("event_sessions").insert(cell_event).execute()
+            if not new_instance.data:
+                num_of_errors.append(cell_event)
+                
+        print(f"Successfully created {len(cell_instances) - len(num_of_errors)} / {len(cell_instances)} cell instances")
+        return {
+            "message": f"Successfully created {len(cell_instances) - len(num_of_errors)} / {len(cell_instances)} cell instances",
+        }
+
+         
+    except Exception as e:
+        print(f"Error creating cell instances: {e}")
+        raise HTTPException(status_code=500, detail="Error creating cell instances")
+
+
+scheduler = AsyncIOScheduler()    
+scheduler.add_job(create_cell_instances,'cron',hour=11,minute=5) 
+# scheduler.add_job(create_cell_instances, 'cron', day_of_week='sun', hour=1, minute=0)
+scheduler.start()
+sleep(10)
+
+@router.get("/update_event_table")
+async def update_event_table():
+    people= []
+    events = supabase.rpc("get_all_unique_events",{"p_event_type":"Cells"}).execute().data
+    for event in events:
+        person = supabase.rpc("get_cell_leader",{"p_email":event.get("event_leader_email"),"p_fullname":event.get("event_leader")}).execute().data
+        if len(person) > 0:
+            leader = person[0]
+            leader_fullname = f"{leader.get("Name")} {leader.get("Surname")}" 
+            if leader.get("LeaderPath[0]") == "692d97e550555e9dfdccea4e":
+                leader1 = "Gavin Enslin"
+            elif leader.get("LeaderPath[0]") == "692d97ec50555e9dfdccecee":
+                leader1 = "Vicky Enslin"
+
+            leader12Query = supabase.table("People").select("*").eq("_id", leader.get("LeaderPath[1]")).limit(1).execute().data
+            leader12 = ""
+            leader12email= ''
+            if len(leader12Query) > 0:
+                leader12 = f"{leader12Query[0].get("Name")} {leader12Query[0].get("Surname")}"
+                leader12email = leader12Query[0].get("Email")
+            leaders = {
+                "leader_at_1": leader1,
+                "leader_at_12": leader12,
+                "leader_at_12_email": leader12email,
+            }
+            people.append({
+                "leader": leader_fullname,
+                "leader1": leader1,
+                "leader12": leader12,
+                "leader12email": leader12email,
+                "event": event
+            })   
+            updated = supabase.table("events").update(leaders).eq("event_id", event.get("event_id")).execute().data
+        else:
+            people.append(event.get("event_leader") + " " + event.get("event_name"))
+    return people        
+    
+    
+@router.get("/update_some_cells")
+async def update_event_table():
+    people= []
+    events = [
+        {"event_name": "Ben Mpasi - Springfield - Open cell - Wednesday","leader_at_1":"Gavin Enslin","leader_at_12":"Kenny Bebel","leader_at_12_email":"kennybebel@gmail.com"},
+        {"event_name": "Blessed Manana - La Rochelle - Open cell - Wednesday","leader_at_1":"Gavin Enslin","leader_at_12":"Kenny Bebel","leader_at_12_email":"kennybebel@gmail.com"},
+        {"event_name": "Cynthia Bebel - Die Fakkel High School - School cell - Thursday","leader_at_1":"Vicky Enslin","leader_at_12":"","leader_at_12_email":""},
+        {"event_name": "Cynthia Bebel - Die Fakkel High School - School cell - Tuesday","leader_at_1":"Vicky Enslin","leader_at_12":"","leader_at_12_email":""},
+        {"event_name": "Cynthia Bebel - Rosettenville - Open cell - Tuesday","leader_at_1":"Vicky Enslin","leader_at_12":"","leader_at_12_email":""},
+        {"event_name": "Cynthia Bebel - Rosettenville Primary - School cell - Wednesday","leader_at_1":"Vicky Enslin","leader_at_12":"","leader_at_12_email":""},
+        {"event_name": "Danielle Holtzhausen - Monument High School - School cell - Friday","leader_at_1":"Vicky Enslin","leader_at_12":"Kayla Enslin","leader_at_12_email":"enslinkayla@gmail.com"},
+        {"event_name": "Denise van de Sandt - Robertsham - Open cell - Tuesday","leader_at_1":"Vicky Enslin","leader_at_12":"","leader_at_12_email":""},
+        {"event_name": "Elvine Kapila - Forest High School - School cell - Thursday","leader_at_1":"Vicky Enslin","leader_at_12":"Sasha-Lee Enslin","leader_at_12_email":"sashlee4@gmail.com"},
+        {"event_name": "Elvine Kapila - Rosettenville - Open cell - Wednesday","leader_at_1":"Vicky Enslin","leader_at_12":"Sasha-Lee Enslin","leader_at_12_email":"sashlee4@gmail.com"},
+        {"event_name": "Elvine Kapila - Forest High School - School cell - Thursday","leader_at_1":"Vicky Enslin","leader_at_12":"Sasha-Lee Enslin","leader_at_12_email":"sashlee4@gmail.com"},
+    {"event_name": "Elvine Kapila - Rosettenville - Open cell - Wednesday","leader_at_1":"Vicky Enslin","leader_at_12":"Sasha-Lee Enslin","leader_at_12_email":"sashlee4@gmail.com"},
+    {"event_name": "Louange Ngoyi - Rosettenville - Open cell - Wednesday","leader_at_1":"Vicky Enslin","leader_at_12":"","leader_at_12_email":""},
+    {"event_name": "Nhlakanipho Madlanga - Die Fakkel High School - Tuesday","leader_at_1":"Gavin Enslin","leader_at_12":"Nash Bobo Mbankumuna","leader_at_12_email":"mbankumunabobo@gmail.com"},
+        {"event_name": "Nhlakanipho Madlanga - Turffontein - Open cell - Wednesday","leader_at_1":"Gavin Enslin","leader_at_12":"Nash Bobo Mbankumuna","leader_at_12_email":"mbankumunabobo@gmail.com"},
+    {"event_name": "Nicholas Shamshum - Tedderfield - Open cell - Saturday","leader_at_1":"Gavin Enslin","leader_at_12":"Shane van der Walt","leader_at_12_email":"shane@theactivechurch.org"},  
+ {"event_name": "Tracy Bebel - Die Fakkel High School - Open cell - Thursday","leader_at_1":"Vicky Enslin","leader_at_12":"Kayla Enslin","leader_at_12_email":"enslinkayla@gmail.com"},
+    {"event_name": "Tracy Bebel - Die Fakkel High School - Open cell - Tuesday","leader_at_1":"Vicky Enslin","leader_at_12":"Kayla Enslin","leader_at_12_email":"enslinkayla@gmail.com"},
+    {"event_name": "Vicky Enslin - Glenanda - Closed cell - Monday","leader_at_1":"","leader_at_12":"","leader_at_12_email":""},
+    ]
+    for event in events[2:]:
+        leaders = {
+            "leader_at_1": event.get("leader_at_1"),
+            "leader_at_12": event.get("leader_at_12"),
+            "leader_at_12_email": event.get("leader_at_12_email")
+        }
+        # 1. Fetch only the first occurrence matching the event name
+        record = (
+            supabase.table("events")
+            .select("event_id")  # Replace "event_id" with your actual primary key column name
+            .eq("event_name", event.get("event_name"))
+            .limit(1)
+            .execute()
+        )
+
+        # 2. Check if a row was found, then update it using its specific ID
+        if record.data:
+            row_id = record.data[0]["event_id"]
+
+            response = (
+                supabase.table("events")
+                .update(leaders)
+                .eq("event_id", row_id)  # Updates only this specific row
+                .execute()
+            )
+            updated_data = response.data
+        else:
+            print("No matching event found.")
+    return updated_data      
+    
+    
+
 
 
 @router.get("/events/eventsdata")

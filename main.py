@@ -2169,7 +2169,7 @@ def convert_event_for_display(event):
 
     if event.get('Time') and not event.get('time'):
         event['time'] = event['Time']
-    elif event.get('time') and not event.get('Time'):
+    elif event.get('time') and not event/events/cells.get('Time'):
         event['Time'] = event['time']
     return event
 
