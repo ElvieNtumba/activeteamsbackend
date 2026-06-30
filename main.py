@@ -4,16 +4,16 @@ from datetime import datetime, timedelta, date, timezone
 import time
 from bson import ObjectId
 import re
-from fastapi import Body, FastAPI, HTTPException, Query, Path, Request ,  Depends, BackgroundTasks, File, UploadFile
+from fastapi import Body, FastAPI, HTTPException, Query, Path, Request, Depends, BackgroundTasks, File, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from auth.models import EventCreate,DecisionType, UserProfile, ConsolidationCreate, UserProfileUpdate, CheckIn, UncaptureRequest, UserCreate,UserCreater,  UserLogin, CellEventCreate, AddMemberNamesRequest, RemoveMemberRequest, RefreshTokenRequest, ForgotPasswordRequest, ResetPasswordRequest, TaskModel,TaskTypeUpdate, PersonCreate, EventTypeCreate, UserListResponse, UserList, MessageResponse, PermissionUpdate, RoleUpdate, AttendanceSubmission, TaskUpdate, EventUpdate ,TaskTypeIn ,TaskTypeOut , LeaderStatusResponse, UserProfile,  OrganizationCreate, OrganizationUpdate, OrganizationResponse, OrganizationList, PeopleResponse, PeopleList
-from auth.utils import hash_password, verify_password, get_next_occurrence_single, parse_time_string, get_leader_cell_name_async, create_access_token, decode_access_token , task_type_serializer, get_current_user 
+from auth.models import EventCreate, DecisionType, UserProfile, ConsolidationCreate, UserProfileUpdate, CheckIn, UncaptureRequest, UserCreate, UserCreater, UserLogin, CellEventCreate, AddMemberNamesRequest, RemoveMemberRequest, RefreshTokenRequest, ForgotPasswordRequest, ResetPasswordRequest, TaskModel, TaskTypeUpdate, PersonCreate, EventTypeCreate, UserListResponse, UserList, MessageResponse, PermissionUpdate, RoleUpdate, AttendanceSubmission, TaskUpdate, EventUpdate, TaskTypeIn, TaskTypeOut, LeaderStatusResponse, UserProfile, OrganizationCreate, OrganizationUpdate, OrganizationResponse, OrganizationList, PeopleResponse, PeopleList
+from auth.utils import hash_password, verify_password, get_next_occurrence_single, parse_time_string, get_leader_cell_name_async, create_access_token, decode_access_token, task_type_serializer, get_current_user
 import math
 import secrets
-from database import db, events_collection, people_collection, users_collection, tasks_collection ,tasktypes_collection,consolidations_collection, organizations_collection, org_config_collection
+from database import db, events_collection, people_collection, users_collection, tasks_collection, tasktypes_collection, consolidations_collection, organizations_collection, org_config_collection
 from auth.email_utils import send_reset_email
-from typing import  List,  Optional,  Dict
+from typing import List, Optional, Dict
 from collections import Counter
 import logging
 import pytz
@@ -30,10 +30,19 @@ from apscheduler.schedulers.background import BackgroundScheduler, BlockingSched
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from time import sleep
 from supreme_admin import router as supreme_admin_router
-app = FastAPI()
+from supabase_helpers.supabase_stats import (
+    sb_get_stats_overview,
+    sb_get_outstanding_items,
+    sb_get_dashboard_quick,
+    sb_get_dashboard_comprehensive,
+)
+from supabase_helpers.service_checkin_routes import router as service_checkin_router
 
 import pandas as pd
 import io
+
+app = FastAPI()
+app.include_router(service_checkin_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -67,6 +76,19 @@ ORG_ID_MAP = {
     "active-church": "active-teams",
     "active church": "active-teams",
 }
+
+def _build_stats_org_filter(current_user: dict) -> Optional[dict]:
+    """
+    Returns None for super-admins (no restriction) or a dict that
+    supabase_stats helpers will apply as a WHERE clause.
+    """
+    is_super = current_user.get("is_supreme_admin") or current_user.get("role") == "super_admin"
+    if is_super:
+        return None
+    org = current_user.get("Organization") or current_user.get("organization")
+    if not org:
+        return None
+    return {"organization": org}
 
 def get_org_from_user(current_user: dict):
     if current_user.get("role") == "super_admin":
@@ -9643,6 +9665,7 @@ async def create_task(task: TaskModel, current_user: dict = Depends(get_current_
         new_task_dict["createdAt"] = datetime.utcnow()
         new_task_dict["Organization"] = organization
 
+        await tasks_collection.insert_one(task_doc)
         result = await db["tasks"].insert_one(new_task_dict)
         new_task_dict["_id"] = str(result.inserted_id)
         return {"status": "success", "task": jsonable_encoder(new_task_dict)}
@@ -10209,236 +10232,38 @@ async def update_task(
 from collections import defaultdict
 
 @app.get("/stats/overview")
-async def get_stats_overview(period: str = "monthly"):
-    """Get overall statistics for the dashboard with time period filtering"""
+async def get_stats_overview(
+    period: str = "monthly",
+    current_user: dict = Depends(get_current_user),
+):
+    org_filter = _build_stats_org_filter(current_user)
     try:
-        # Calculate date range based on period
-        now = datetime.utcnow()
-        if period == "daily":
-            start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            end_date = start_date + timedelta(days=1)
-        elif period == "weekly":
-            start_date = now - timedelta(days=now.weekday())
-            start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
-            end_date = start_date + timedelta(days=7)
-        else:  # monthly
-            start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            if now.month == 12:
-                end_date = now.replace(year=now.year + 1, month=1, day=1)
-            else:
-                end_date = now.replace(month=now.month + 1, day=1)
-        outstanding_cells = await events_collection.count_documents({
-            "eventType": "Cell",
-            "status": {"$nin": ["completed", "closed", "done"]}
-        })
-        outstanding_tasks = await tasks_collection.count_documents({
-            "status": {"$nin": ["completed", "closed", "done"]}
-        })
-       
-        total_people = await people_collection.count_documents({})
-       
-        period_events = await events_collection.find({
-            "date": {"$gte": start_date, "$lt": end_date},
-            "status": {"$in": ["completed", "closed"]},
-            "eventType": {"$ne": "Cell"} 
-        }).to_list(length=None)
-       
-        total_attendance = sum(event.get("total_attendance", 0) for event in period_events)
-       
-        if period == "daily":
-            prev_start = start_date - timedelta(days=1)
-            prev_end = start_date
-        elif period == "weekly":
-            prev_start = start_date - timedelta(days=7)
-            prev_end = start_date
-        else:  # monthly
-            if start_date.month == 1:
-                prev_start = start_date.replace(year=start_date.year - 1, month=12)
-            else:
-                prev_start = start_date.replace(month=start_date.month - 1)
-            prev_end = start_date
-       
-        prev_events = await events_collection.find({
-            "date": {"$gte": prev_start, "$lt": prev_end},
-            "status": {"$in": ["completed", "closed"]},
-            "eventType": {"$ne": "Cell"}
-        }).to_list(length=None)
-       
-        prev_attendance = sum(event.get("total_attendance", 0) for event in prev_events)
-       
-        # Calculate growth rate
-        if prev_attendance > 0:
-            growth_rate = ((total_attendance - prev_attendance) / prev_attendance) * 100
-        else:
-            growth_rate = 100 if total_attendance > 0 else 0
-       
-        # Calculate weekly/daily attendance breakdown (exclude cells)
-        attendance_breakdown = {}
-        for event in period_events:
-            if event.get("date"):
-                event_date = event["date"]
-                if period == "daily":
-                    # Group by hour for daily view
-                    hour = event_date.hour
-                    key = f"{hour:02d}:00"
-                elif period == "weekly":
-                    # Group by day name for weekly view
-                    key = event_date.strftime("%A")
-                else:
-                    # aligning weekly breakdowns with date-based attendance keys (fixes mismatch bug).
-                    week_start = event_date.date() - timedelta(days=event_date.weekday())  
-                    key = week_start.strftime("%Y-%m-%d")  
-               
-                if key not in attendance_breakdown:
-                    attendance_breakdown[key] = 0
-                attendance_breakdown[key] += event.get("total_attendance", 0)
-       
-        return {
-            "outstanding_cells": outstanding_cells,
-            "outstanding_tasks": outstanding_tasks,  
-            "total_people": total_people,
-            "total_attendance": total_attendance,
-            "growth_rate": round(growth_rate, 1),
-            "attendance_breakdown": attendance_breakdown,
-            "period": period
-        }
+        return await asyncio.to_thread(sb_get_stats_overview, period, org_filter)
     except Exception as e:
         print(f"Error in stats overview: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/stats/outstanding-items")
-async def get_outstanding_items():
-    """Get detailed outstanding cells and tasks for the dashboard"""
+async def get_outstanding_items(
+    current_user: dict = Depends(get_current_user),
+):
+    org_filter = _build_stats_org_filter(current_user)
     try:
-        # Get outstanding cells with details
-        outstanding_cells = await events_collection.find({
-            "eventType": "Cell",
-            "status": {"$nin": ["completed", "closed", "done"]}
-        }).to_list(length=None)
-       
-        # Get outstanding tasks with details
-        outstanding_tasks = await tasks_collection.find({
-            "status": {"$nin": ["completed", "closed", "done"]}
-        }).to_list(length=None)
-       
-        # Format cells data
-        cells_data = []
-        for cell in outstanding_cells:
-            cells_data.append({
-                "name": cell.get("eventLeader", "Unknown Leader"),
-                "location": cell.get("location", "Unknown Location"),
-                "title": cell.get("eventName", "Untitled Cell"),
-                "date": cell.get("date"),
-                "status": cell.get("status", "pending")
-            })
-       
-        # Format tasks data
-        tasks_data = []
-        for task in outstanding_tasks:
-            tasks_data.append({
-                "name": task.get("assignedTo", task.get("eventLeader", "Unassigned")),
-                "email": task.get("email", ""),
-                "title": task.get("taskName", task.get("title", "Untitled Task")),
-                "count": task.get("priority", 1),  # Using priority as count or you can count tasks per person
-                "dueDate": task.get("dueDate", task.get("date")),
-                "status": task.get("status", "pending")
-            })
-       
-        return {
-            "outstanding_cells": cells_data,
-            "outstanding_tasks": tasks_data
-        }
-       
+        return await asyncio.to_thread(sb_get_outstanding_items, org_filter)
     except Exception as e:
         print(f"Error in outstanding items: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/stats/people-with-tasks")
-async def get_people_capture_stats():
-    """
-    Get team members and how many people they have captured/recruited
-    """
+async def get_people_capture_stats(
+    current_user: dict = Depends(get_current_user),
+):
+    org_filter = _build_stats_org_filter(current_user)
     try:
-        client = get_database_client()
-        db = client[DB_NAME]
-       
-        pipeline = [
-            {
-                "$match": {
-                    "captured_by": {"$exists": True, "$ne": None} 
-                }
-            },
-            {
-                "$group": {
-                    "_id": "$captured_by", 
-                    "people_captured_count": {"$sum": 1},
-                    "captured_people": {
-                        "$push": {
-                            "name": "$fullName",
-                            "email": "$email",
-                            "capture_date": "$created_date" 
-                        }
-                    }
-                }
-            },
-            {
-                "$lookup": {
-                    "from": "people",
-                    "localField": "_id",
-                    "foreignField": "_id",  # or "email" depending on your schema
-                    "as": "capturer_details"
-                }
-            },
-            {
-                "$unwind": {
-                    "path": "$capturer_details",
-                    "preserveNullAndEmptyArrays": True
-                }
-            },
-            {
-                "$project": {
-                    "capturer_id": "$_id",
-                    "capturer_name": {
-                        "$ifNull": ["$capturer_details.fullName", "$capturer_details.name", "Unknown Capturer"]
-                    },
-                    "capturer_email": {
-                        "$ifNull": ["$capturer_details.email", "No email"]
-                    },
-                    "people_captured_count": 1,
-                    "captured_people": 1,
-                    "_id": 0
-                }
-            },
-            {
-                "$sort": {"people_captured_count": -1} 
-            }
-        ]
-       
-        results = list(db.people.aggregate(pipeline))  
-       
-        if not results:
-            return {
-                "capture_stats": [],
-                "total_capturers": 0,
-                "total_people_captured": 0,
-                "message": "No capture data found"
-            }
-       
-        total_people_captured = sum(item['people_captured_count'] for item in results)
-       
-        return {
-            "capture_stats": results,
-            "total_capturers": len(results),
-            "total_people_captured": total_people_captured,
-            "message": f"Found {len(results)} team members who captured {total_people_captured} people total"
-        }
-       
+        return await asyncio.to_thread(sb_get_people_capture_stats, org_filter)
     except Exception as e:
-        print(f"Error fetching capture stats: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to fetch capture statistics: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to fetch capture statistics: {str(e)}")
 
 # --- ROLE MANAGEMENT ENDPOINTS (Admin only) ---
 ROLE_PERMISSIONS = {
@@ -12185,11 +12010,11 @@ async def get_event_new_people(event_id: str = Path(...)):
         raise HTTPException(status_code=500, detail=str(e))
    
  
-@app.get("/service-checkin/real-time-data")
-async def get_service_checkin_real_time_data(
-    event_id: str = Query(...),
-    current_user: dict = Depends(get_current_user)
-):
+# @app.get("/service-checkin/real-time-data")
+# async def get_service_checkin_real_time_data(
+#     event_id: str = Query(...),
+#     current_user: dict = Depends(get_current_user)
+# ):
     try:
         parts = event_id.split("_")
         base_event_id = parts[0]
@@ -12249,13 +12074,13 @@ async def get_service_checkin_real_time_data(
         raise HTTPException(status_code=500, detail=f"Error fetching real-time data: {str(e)}")
  
  
-@app.get("/service-checkin/validate-removal")
-async def validate_removal(
-    event_id: str = Query(..., description="Event ID"),
-    consolidation_id: str = Query(None, description="Consolidation ID"),
-    person_id: str = Query(None, description="Person ID"),
-    current_user: dict = Depends(get_current_user)
-):
+# @app.get("/service-checkin/validate-removal")
+# async def validate_removal(
+#     event_id: str = Query(..., description="Event ID"),
+#     consolidation_id: str = Query(None, description="Consolidation ID"),
+#     person_id: str = Query(None, description="Person ID"),
+#     current_user: dict = Depends(get_current_user)
+# ):
     """Validate what will be affected by removal."""
     try:
         if not consolidation_id and not person_id:
@@ -12298,11 +12123,11 @@ async def validate_removal(
         raise HTTPException(status_code=500, detail=f"Validation error: {str(e)}")
  
  
-@app.post("/service-checkin/checkin")
-async def service_checkin_person(
-    checkin_data: dict = Body(...),
-    current_user: dict = Depends(get_current_user)
-):
+# @app.post("/service-checkin/checkin")
+# async def service_checkin_person(
+#     checkin_data: dict = Body(...),
+#     current_user: dict = Depends(get_current_user)
+# ):
     try:
         event_id = checkin_data.get("event_id")
         person_data = checkin_data.get("person_data", {})
@@ -12442,11 +12267,11 @@ async def service_checkin_person(
         raise HTTPException(status_code=500, detail="Check-in failed")
  
  
-@app.delete("/service-checkin/remove")
-async def remove_from_service_checkin(
-    removal_data: dict = Body(...),
-    current_user: dict = Depends(get_current_user)
-):
+# @app.delete("/service-checkin/remove")
+# async def remove_from_service_checkin(
+#     removal_data: dict = Body(...),
+#     current_user: dict = Depends(get_current_user)
+# ):
     try:
         event_id = removal_data.get("event_id")
         person_id = removal_data.get("person_id")
@@ -12521,91 +12346,91 @@ async def remove_from_service_checkin(
         raise HTTPException(status_code=500, detail=f"Error removing person: {str(e)}")
  
  
-@app.put("/service-checkin/update")
-async def update_service_checkin_person(
-    update_data: dict = Body(...),
-    current_user: dict = Depends(get_current_user)
-):
-    """Update a person in any of the three data types, with recurring event support."""
-    try:
-        event_id = update_data.get("event_id")
-        person_id = update_data.get("person_id")
-        data_type = update_data.get("type")
-        update_fields = update_data.get("update_fields", {})
+# @app.put("/service-checkin/update")
+# async def update_service_checkin_person(
+#     update_data: dict = Body(...),
+#     current_user: dict = Depends(get_current_user)
+# ):
+#     """Update a person in any of the three data types, with recurring event support."""
+#     try:
+#         event_id = update_data.get("event_id")
+#         person_id = update_data.get("person_id")
+#         data_type = update_data.get("type")
+#         update_fields = update_data.get("update_fields", {})
  
-        print(f"Updating service check-in - Event: {event_id}, Type: {data_type}, ID: {person_id}")
+#         print(f"Updating service check-in - Event: {event_id}, Type: {data_type}, ID: {person_id}")
  
-        if not event_id or not ObjectId.is_valid(event_id):
-            raise HTTPException(status_code=400, detail="Invalid event ID")
+#         if not event_id or not ObjectId.is_valid(event_id):
+#             raise HTTPException(status_code=400, detail="Invalid event ID")
  
-        if not person_id or not data_type:
-            raise HTTPException(status_code=400, detail="Person ID and type are required")
+#         if not person_id or not data_type:
+#             raise HTTPException(status_code=400, detail="Person ID and type are required")
  
-        valid_types = ["attendees", "new_people", "consolidations"]
-        if data_type not in valid_types:
-            raise HTTPException(status_code=400, detail=f"Type must be one of: {valid_types}")
+#         valid_types = ["attendees", "new_people", "consolidations"]
+#         if data_type not in valid_types:
+#             raise HTTPException(status_code=400, detail=f"Type must be one of: {valid_types}")
  
-        event = await events_collection.find_one({"_id": ObjectId(event_id)})
-        if not event:
-            raise HTTPException(status_code=404, detail="Event not found")
+#         event = await events_collection.find_one({"_id": ObjectId(event_id)})
+#         if not event:
+#             raise HTTPException(status_code=404, detail="Event not found")
  
-        is_recurring = bool(event.get("recurring_day"))
-        now = datetime.utcnow().isoformat()
+#         is_recurring = bool(event.get("recurring_day"))
+#         now = datetime.utcnow().isoformat()
  
-        if is_recurring:
-            # ← FIXED: recurring events store data under attendance.{date}.{data_type}
-            tz = pytz.timezone("Africa/Johannesburg")
-            instance_date = datetime.now(tz).date().isoformat()
+#         if is_recurring:
+#             # ← FIXED: recurring events store data under attendance.{date}.{data_type}
+#             tz = pytz.timezone("Africa/Johannesburg")
+#             instance_date = datetime.now(tz).date().isoformat()
  
-            set_fields = {}
-            for field, value in update_fields.items():
-                set_fields[f"attendance.{instance_date}.{data_type}.$.{field}"] = value
-            set_fields[f"attendance.{instance_date}.updated_at"] = now
-            set_fields["updated_at"] = now
+#             set_fields = {}
+#             for field, value in update_fields.items():
+#                 set_fields[f"attendance.{instance_date}.{data_type}.$.{field}"] = value
+#             set_fields[f"attendance.{instance_date}.updated_at"] = now
+#             set_fields["updated_at"] = now
  
-            result = await events_collection.update_one(
-                {
-                    "_id": ObjectId(event_id),
-                    f"attendance.{instance_date}.{data_type}.id": person_id
-                },
-                {"$set": set_fields}
-            )
-        else:
-            set_fields = {}
-            for field, value in update_fields.items():
-                set_fields[f"{data_type}.$.{field}"] = value
-            set_fields["updated_at"] = now
+#             result = await events_collection.update_one(
+#                 {
+#                     "_id": ObjectId(event_id),
+#                     f"attendance.{instance_date}.{data_type}.id": person_id
+#                 },
+#                 {"$set": set_fields}
+#             )
+#         else:
+#             set_fields = {}
+#             for field, value in update_fields.items():
+#                 set_fields[f"{data_type}.$.{field}"] = value
+#             set_fields["updated_at"] = now
  
-            result = await events_collection.update_one(
-                {
-                    "_id": ObjectId(event_id),
-                    f"{data_type}.id": person_id
-                },
-                {"$set": set_fields}
-            )
+#             result = await events_collection.update_one(
+#                 {
+#                     "_id": ObjectId(event_id),
+#                     f"{data_type}.id": person_id
+#                 },
+#                 {"$set": set_fields}
+#             )
  
-        if result.modified_count == 0:
-            raise HTTPException(status_code=404, detail="Person not found or no changes made")
+#         if result.modified_count == 0:
+#             raise HTTPException(status_code=404, detail="Person not found or no changes made")
  
-        print(f"Successfully updated in {data_type}")
+#         print(f"Successfully updated in {data_type}")
  
-        return {
-            "success": True,
-            "message": f"Person updated in {data_type} successfully"
-        }
+#         return {
+#             "success": True,
+#             "message": f"Person updated in {data_type} successfully"
+#         }
  
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Error updating service check-in: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error updating person: {str(e)}")
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         print(f"Error updating service check-in: {str(e)}")
+#         raise HTTPException(status_code=500, detail=f"Error updating person: {str(e)}")
    
    
-@app.post("/events/{event_id}/initialize-structure")
-async def initialize_event_structure(
-    event_id: str,
-    current_user: dict = Depends(get_current_user)
-):
+# @app.post("/events/{event_id}/initialize-structure")
+# async def initialize_event_structure(
+#     event_id: str,
+#     current_user: dict = Depends(get_current_user)
+# ):
     """
     Initialize a new event with the three-type structure
     """
@@ -12840,705 +12665,46 @@ EXCLUDED_TASK_TYPES_FROM_COMPLETED = ["no answer", "Awaiting Call"]
 async def get_dashboard_comprehensive(
     period: str = Query(
         "today",
-        pattern="^(today|thisWeek|thisMonth|previous7|previousWeek|previousMonth)$"
+        pattern="^(today|thisWeek|thisMonth|previous7|previousWeek|previousMonth)$",
     ),
     limit: int = Query(100, ge=1, le=1000),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
+    org_name = current_user.get("Organization")
+    if not org_name and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Organization not associated with user")
+ 
+    org_filter = _build_stats_org_filter(current_user)
     try:
-        org_name = current_user.get("Organization")
-        if not org_name:
-            raise HTTPException(status_code=403, detail="Organization not associated with user")
-
-        is_super_admin = current_user.get("role") == "super_admin"
-        org_filter = {} if is_super_admin else {"Organization": org_name}
-
-        print(f"[DASHBOARD] Comprehensive stats requested - Period: {period}, Org: {org_name}, SuperAdmin: {is_super_admin}")
-
-        start, end = get_period_range(period)
-        start_date_str = start.date().isoformat()
-        end_date_str = end.date().isoformat()
-
-        # Task types filtered by organization
-        task_types_cursor = tasktypes_collection.find(org_filter, {"name": 1})
-        task_types_list = await task_types_cursor.to_list(length=None)
-        all_task_types = [tt.get("name") for tt in task_types_list if tt.get("name")]
-
-        # Overdue cells pipeline
-        overdue_cells_pipeline = [
-            {
-                "$match": {
-                    **org_filter,
-                    "$and": [
-                        {
-                            "$or": [
-                                {"Event Type": {"$regex": "^Cells$", "$options": "i"}},
-                                {"eventType": {"$regex": "^Cells$", "$options": "i"}},
-                                {"eventTypeName": {"$regex": "^Cells$", "$options": "i"}}
-                            ]
-                        },
-                        {"date": {"$lte": end}},
-                        {
-                            "$or": [
-                                {"status": "incomplete"},
-                                {"status": {"$exists": False}},
-                                {"status": None},
-                                {"Status": "Incomplete"},
-                                {"_is_overdue": True}
-                            ]
-                        }
-                    ]
-                }
-            },
-            {"$sort": {"date": -1}},
-            {"$limit": 100},
-            {
-                "$project": {
-                    "_id": 1,
-                    "UUID": 1,
-                    "eventName": {
-                        "$ifNull": [
-                            "$Event Name",
-                            {"$ifNull": ["$eventName", {"$ifNull": ["$EventName", "Unnamed Event"]}]}
-                        ]
-                    },
-                    "eventType": {
-                        "$ifNull": [
-                            "$Event Type",
-                            {"$ifNull": ["$eventType", {"$ifNull": ["$eventTypeName", "Cells"]}]}
-                        ]
-                    },
-                    "eventLeaderName": {
-                        "$ifNull": [
-                            "$Leader",
-                            {"$ifNull": ["$eventLeaderName", {"$ifNull": ["$EventLeaderName", "Unknown Leader"]}]}
-                        ]
-                    },
-                    "eventLeaderEmail": {
-                        "$ifNull": [
-                            "$Email",
-                            {"$ifNull": ["$eventLeaderEmail", {"$ifNull": ["$EventLeaderEmail", ""]}]}
-                        ]
-                    },
-                    "leader1": {
-                        "$ifNull": [
-                            "$leader1",
-                            {"$ifNull": ["$Leader @1", ""]}
-                        ]
-                    },
-                    "leader12": {
-                        "$ifNull": [
-                            "$Leader at 12",
-                            {"$ifNull": ["$Leader @12", {"$ifNull": ["$leader12", {"$ifNull": ["$Leader12", ""]}]}]}
-                        ]
-                    },
-                    "day": {
-                        "$ifNull": [
-                            "$Day",
-                            {"$ifNull": ["$day", ""]}
-                        ]
-                    },
-                    "date": 1,
-                    "location": {
-                        "$ifNull": [
-                            "$Location",
-                            {"$ifNull": ["$location", ""]}
-                        ]
-                    },
-                    "attendees": {"$ifNull": ["$attendees", []]},
-                    "persistent_attendees": {"$ifNull": ["$persistent_attendees", []]},
-                    "hasPersonSteps": {"$ifNull": ["$hasPersonSteps", True]},
-                    "status": {
-                        "$ifNull": [
-                            "$status",
-                            {"$ifNull": ["$Status", "incomplete"]}
-                        ]
-                    },
-                    "_is_overdue": {"$literal": True},
-                    "is_recurring": {"$ifNull": ["$is_recurring", True]},
-                    "week_identifier": 1,
-                    "original_event_id": {"$toString": "$_id"}
-                }
-            }
-        ]
-
-        # Tasks pipeline
-        tasks_pipeline = [
-            {
-                "$match": {
-                    **org_filter,
-                    "$or": [
-                        {"followup_date": {"$gte": start, "$lte": end}},
-                        {"completedAt": {"$gte": start, "$lte": end}},
-                        {"createdAt": {"$gte": start, "$lte": end}}
-                    ]
-                }
-            },
-            {
-                "$addFields": {
-                    "task_type_label": {"$ifNull": ["$taskType", "Uncategorized"]},
-                    "is_excluded_type": {
-                        "$cond": [
-                            {
-                                "$and": [
-                                    {"$ne": ["$taskType", None]},
-                                    {"$in": ["$taskType", EXCLUDED_TASK_TYPES_FROM_COMPLETED]}
-                                ]
-                            },
-                            True,
-                            False
-                        ]
-                    },
-                    "is_completed": {
-                        "$cond": [
-                            {
-                                "$and": [
-                                    {
-                                        "$in": [
-                                            {"$toLower": {"$ifNull": ["$status", "pending"]}},
-                                            ["completed", "done", "closed", "finished"]
-                                        ]
-                                    },
-                                    {
-                                        "$not": [
-                                            {
-                                                "$and": [
-                                                    {"$ne": ["$taskType", None]},
-                                                    {"$in": ["$taskType", EXCLUDED_TASK_TYPES_FROM_COMPLETED]}
-                                                ]
-                                            }
-                                        ]
-                                    }
-                                ]
-                            },
-                            True,
-                            False
-                        ]
-                    },
-                    "completed_in_period": {
-                        "$cond": [
-                            {
-                                "$and": [
-                                    {"$ne": ["$completedAt", None]},
-                                    {"$gte": ["$completedAt", start]},
-                                    {"$lte": ["$completedAt", end]},
-                                    {
-                                        "$in": [
-                                            {"$toLower": {"$ifNull": ["$status", "pending"]}},
-                                            ["completed", "done", "closed", "finished"]
-                                        ]
-                                    },
-                                    {
-                                        "$not": [
-                                            {
-                                                "$and": [
-                                                    {"$ne": ["$taskType", None]},
-                                                    {"$in": ["$taskType", EXCLUDED_TASK_TYPES_FROM_COMPLETED]}
-                                                ]
-                                            }
-                                        ]
-                                    }
-                                ]
-                            },
-                            True,
-                            False
-                        ]
-                    },
-                    "is_due_in_period": {
-                        "$cond": [
-                            {
-                                "$and": [
-                                    {"$ne": ["$followup_date", None]},
-                                    {"$gte": ["$followup_date", start]},
-                                    {"$lte": ["$followup_date", end]}
-                                ]
-                            },
-                            True,
-                            False
-                        ]
-                    }
-                }
-            },
-            {
-                "$group": {
-                    "_id": "$assignedfor",
-                    "tasks": {
-                        "$push": {
-                            "_id": "$_id",
-                            "name": "$name",
-                            "taskType": "$taskType",
-                            "task_type_label": "$task_type_label",
-                            "followup_date": "$followup_date",
-                            "due_date": "$followup_date",
-                            "completedAt": "$completedAt",
-                            "createdAt": "$createdAt",
-                            "status": "$status",
-                            "assignedfor": "$assignedfor",
-                            "type": "$type",
-                            "contacted_person": "$contacted_person",
-                            "isRecurring": {
-                                "$cond": [
-                                    {"$ifNull": ["$recurring_day", False]},
-                                    True,
-                                    False
-                                ]
-                            },
-                            "priority": "$priority",
-                            "is_completed": "$is_completed",
-                            "is_due_in_period": "$is_due_in_period",
-                            "completed_in_period": "$completed_in_period",
-                            "is_excluded_type": "$is_excluded_type",
-                            "description": "$description"
-                        }
-                    },
-                    "total_tasks": {"$sum": 1},
-                    "completed_tasks": {"$sum": {"$cond": ["$is_completed", 1, 0]}},
-                    "completed_in_period": {"$sum": {"$cond": ["$completed_in_period", 1, 0]}},
-                    "due_in_period": {"$sum": {"$cond": ["$is_due_in_period", 1, 0]}},
-                    "task_type_counts": {
-                        "$push": {
-                            "task_type": "$task_type_label",
-                            "is_completed": "$is_completed",
-                            "completed_in_period": "$completed_in_period",
-                            "is_due_in_period": "$is_due_in_period",
-                            "is_excluded_type": "$is_excluded_type"
-                        }
-                    }
-                }
-            },
-            {"$match": {"total_tasks": {"$gt": 0}}},
-            {"$sort": {"_id": 1}}
-        ]
-
-        overdue_cells_cursor = events_collection.aggregate(overdue_cells_pipeline)
-        tasks_cursor = tasks_collection.aggregate(tasks_pipeline)
-        users_cursor = users_collection.find(
-            org_filter,
-            {"_id": 1, "email": 1, "name": 1, "surname": 1}
-        ).limit(limit)
-
-        overdue_cells, task_groups, users = await asyncio.gather(
-            overdue_cells_cursor.to_list(100),
-            tasks_cursor.to_list(None),
-            users_cursor.to_list(limit)
+        return await asyncio.to_thread(
+            sb_get_dashboard_comprehensive, period, limit, org_filter
         )
-
-        formatted_overdue_cells = []
-        for cell in overdue_cells:
-            cell["_id"] = str(cell["_id"])
-            if isinstance(cell.get("date"), datetime):
-                cell["date"] = cell["date"].isoformat()
-            formatted_overdue_cells.append(cell)
-
-        # User map
-        all_users_map = {}
-        try:
-            all_users_cursor = users_collection.find({}, {"_id": 1, "email": 1, "name": 1, "surname": 1})
-            async for user in all_users_cursor:
-                uid = str(user["_id"])
-                email = user.get("email", "").lower()
-                if not email:
-                    continue
-
-                person = await users_collection.find_one({
-                    "$or": [
-                        {"Email": {"$regex": f"^{email}$", "$options": "i"}},
-                        {"user_id": uid}
-                    ]
-                })
-
-                if person:
-                    full_name = f"{person.get('Name', '').strip()} {person.get('Surname', '').strip()}".strip()
-                else:
-                    full_name = f"{user.get('name', '')} {user.get('surname', '')}".strip()
-
-                if not full_name:
-                    full_name = email.split("@")[0]
-
-                all_users_map[email] = {
-                    "_id": uid,
-                    "email": email,
-                    "fullName": full_name
-                }
-                all_users_map[uid] = all_users_map[email]
-
-        except Exception as e:
-            print(f"[DASHBOARD] Error building user map: {e}")
-
-        # Process task groups
-        grouped_tasks = []
-        all_tasks_list = []
-        global_total_tasks = 0
-        global_completed_tasks = 0
-        global_completed_in_period = 0
-        global_due_in_period = 0
-        global_incomplete_due = 0
-        task_type_stats = {}
-
-        for task_group in task_groups:
-            email = task_group["_id"] or "unassigned@example.com"
-
-            user_info = all_users_map.get(email.lower(), {
-                "_id": f"unknown_{email}",
-                "email": email,
-                "fullName": email.split("@")[0]
-            })
-
-            tasks_list = task_group["tasks"]
-
-            for task in tasks_list:
-                task["_id"] = str(task["_id"])
-
-                for date_field in ["followup_date", "due_date", "completedAt", "createdAt"]:
-                    if isinstance(task.get(date_field), datetime):
-                        task[date_field] = task[date_field].isoformat()
-
-                task_type = task.get("taskType") or "Uncategorized"
-                is_excluded = task.get("is_excluded_type", False)
-
-                if task_type not in task_type_stats:
-                    task_type_stats[task_type] = {
-                        "total": 0,
-                        "completed": 0,
-                        "completed_in_period": 0,
-                        "due_in_period": 0,
-                        "incomplete_due": 0,
-                        "is_excluded": is_excluded
-                    }
-
-                task_type_stats[task_type]["total"] += 1
-
-                if task.get("is_completed"):
-                    task_type_stats[task_type]["completed"] += 1
-
-                if task.get("completed_in_period"):
-                    task_type_stats[task_type]["completed_in_period"] += 1
-
-                if task.get("is_due_in_period"):
-                    task_type_stats[task_type]["due_in_period"] += 1
-
-                if task.get("is_due_in_period") and not task.get("is_completed"):
-                    task_type_stats[task_type]["incomplete_due"] += 1
-
-            total_for_user = task_group["total_tasks"]
-            completed_all = task_group["completed_tasks"]
-            completed_in_period = task_group["completed_in_period"]
-            due_in_period = task_group["due_in_period"]
-            incomplete_due = sum(
-                1 for t in tasks_list
-                if t.get("is_due_in_period") and not t.get("is_completed")
-            )
-            incomplete_all = total_for_user - completed_all
-
-            global_total_tasks += total_for_user
-            global_completed_tasks += completed_all
-            global_completed_in_period += completed_in_period
-            global_due_in_period += due_in_period
-            global_incomplete_due += incomplete_due
-
-            grouped_tasks.append({
-                "user": user_info,
-                "tasks": tasks_list,
-                "totalCount": total_for_user,
-                "completedCount": completed_all,
-                "incompleteCount": incomplete_all,
-                "dueInPeriodCount": due_in_period,
-                "completedInPeriodCount": completed_in_period,
-                "incompleteDueInPeriodCount": incomplete_due,
-                "taskTypes": list(set([t.get("taskType") or "Uncategorized" for t in tasks_list]))
-            })
-
-            all_tasks_list.extend(tasks_list)
-
-        grouped_tasks.sort(key=lambda x: x["user"]["fullName"].lower())
-
-        completion_rate_due = round(
-            (global_completed_in_period / global_due_in_period * 100), 2
-        ) if global_due_in_period > 0 else 0
-
-        completion_rate_overall = round(
-            (global_completed_tasks / global_total_tasks * 100), 2
-        ) if global_total_tasks > 0 else 0
-
-        unique_task_types_found = list(task_type_stats.keys())
-
-        overview = {
-            "total_attendance": sum(len(c.get("attendees", [])) for c in formatted_overdue_cells),
-            "outstanding_cells": len(formatted_overdue_cells),
-            "outstanding_tasks": global_incomplete_due,
-            "tasks_due_in_period": global_due_in_period,
-            "tasks_completed_in_period": global_completed_in_period,
-            "total_tasks_in_period": global_total_tasks,
-            "total_tasks_completed": global_completed_tasks,
-            "total_tasks_incomplete": global_total_tasks - global_completed_tasks,
-            "consolidation_tasks": task_type_stats.get("consolidation", {}).get("total", 0),
-            "consolidation_completed": task_type_stats.get("consolidation", {}).get("completed", 0),
-            "consolidation_completed_in_period": task_type_stats.get("consolidation", {}).get("completed_in_period", 0),
-            "people_behind": len([g for g in grouped_tasks if g["incompleteDueInPeriodCount"] > 0]),
-            "total_users": len(users),
-            "completion_rate_due_tasks": completion_rate_due,
-            "completion_rate_overall": completion_rate_overall,
-            "consolidation_completion_rate": round(
-                (
-                    task_type_stats.get("consolidation", {}).get("completed", 0) /
-                    task_type_stats.get("consolidation", {}).get("total", 1) * 100
-                ),
-                2
-            ) if task_type_stats.get("consolidation", {}).get("total", 0) > 0 else 0,
-            "task_type_breakdown": task_type_stats,
-            "users_with_tasks": len(grouped_tasks),
-            "users_without_tasks": len(users) - len(grouped_tasks),
-            "available_task_types": all_task_types,
-            "task_types_found": unique_task_types_found,
-            "excluded_task_types": EXCLUDED_TASK_TYPES_FROM_COMPLETED,
-            "total_unique_task_types": len(unique_task_types_found),
-            "note": "'no answer' and 'Awaiting Call' task types are excluded from completed counts"
-        }
-
-        # Deduplicate users
-        seen_user_ids = set()
-        all_users_list = []
-
-        for user_info in all_users_map.values():
-            if (
-                isinstance(user_info, dict)
-                and "_id" in user_info
-                and not user_info["_id"].startswith("unknown_")
-                and user_info["_id"] not in seen_user_ids
-            ):
-                seen_user_ids.add(user_info["_id"])
-                full_name_parts = user_info["fullName"].split()
-
-                all_users_list.append({
-                    "_id": user_info["_id"],
-                    "email": user_info["email"],
-                    "name": full_name_parts[0] if full_name_parts else "",
-                    "surname": " ".join(full_name_parts[1:]) if len(full_name_parts) > 1 else "",
-                    "fullName": user_info["fullName"]
-                })
-
-        return {
-            "overview": overview,
-            "overdueCells": formatted_overdue_cells,
-            "groupedTasks": grouped_tasks,
-            "allTasks": all_tasks_list,
-            "allUsers": all_users_list,
-            "period": period,
-            "date_range": {"start": start_date_str, "end": end_date_str},
-            "task_type_stats": task_type_stats,
-            "available_task_types": all_task_types,
-            "task_types_found": unique_task_types_found,
-            "excluded_task_types": EXCLUDED_TASK_TYPES_FROM_COMPLETED,
-            "timestamp": datetime.utcnow().isoformat()
-        }
-
     except Exception as e:
-        import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error fetching comprehensive stats: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error fetching comprehensive stats: {str(e)}",
+        )
 
 # ====================== QUICK DASHBOARD (MULTI-TENANT) ======================
 @app.get("/stats/dashboard-quick")
 async def get_dashboard_quick_stats(
-    period: str = Query("today", regex="^(today|thisWeek|thisMonth|previous7|previousWeek|previousMonth)$"),
-    current_user: dict = Depends(get_current_user)
+    period: str = Query(
+        "today",
+        pattern="^(today|thisWeek|thisMonth|previous7|previousWeek|previousMonth)$",
+    ),
+    current_user: dict = Depends(get_current_user),
 ):
+    org_name = current_user.get("Organization")
+    if not org_name and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Organization not associated with user")
+ 
+    org_filter = _build_stats_org_filter(current_user)
     try:
-        org_name = current_user.get("Organization")
-        if not org_name:
-            raise HTTPException(status_code=403, detail="Organization not associated with user")
-
-        is_super_admin = current_user.get("role") == "super_admin"
-        org_filter = {} if is_super_admin else {"Organization": org_name}
-
-        start, end = get_period_range(period)
-        start_str = start.date().isoformat()
-        end_str = end.date().isoformat()
-
-        total_tasks_all = await tasks_collection.count_documents({
-            **org_filter,
-            "$or": [
-                {"followup_date": {"$gte": start, "$lte": end}},
-                {"completedAt": {"$gte": start, "$lte": end}},
-                {"createdAt": {"$gte": start, "$lte": end}}
-            ]
-        })
-
-        tasks_due_in_period = await tasks_collection.count_documents({
-            **org_filter,
-            "followup_date": {"$gte": start, "$lte": end},
-            "status": {"$nin": ["completed", "done", "closed", "finished"]}
-        })
-
-        tasks_completed_in_period = await tasks_collection.count_documents({
-            **org_filter,
-            "completedAt": {"$gte": start, "$lte": end},
-            "status": {"$in": ["completed", "done", "closed", "finished"]},
-            "taskType": {"$nin": EXCLUDED_TASK_TYPES_FROM_COMPLETED}
-        })
-
-        total_tasks_in_period = await tasks_collection.count_documents({
-            **org_filter,
-            "$or": [
-                {"followup_date": {"$gte": start, "$lte": end}},
-                {"completedAt": {"$gte": start, "$lte": end}},
-                {"createdAt": {"$gte": start, "$lte": end}}
-            ]
-        })
-
-        total_completed = await tasks_collection.count_documents({
-            **org_filter,
-            "status": {"$in": ["completed", "done", "closed", "finished"]},
-            "taskType": {"$nin": EXCLUDED_TASK_TYPES_FROM_COMPLETED}
-        })
-
-        consolidation_completed_in_period = await tasks_collection.count_documents({
-            **org_filter,
-            "completedAt": {"$gte": start, "$lte": end},
-            "status": {"$in": ["completed", "done", "closed", "finished"]},
-            "taskType": "consolidation"
-        })
-
-        total_consolidation_tasks = await tasks_collection.count_documents({
-            **org_filter,
-            "taskType": "consolidation"
-        })
-
-        total_consolidation_completed = await tasks_collection.count_documents({
-            **org_filter,
-            "taskType": "consolidation",
-            "status": {"$in": ["completed", "done", "closed", "finished"]}
-        })
-
-        no_answer_count = await tasks_collection.count_documents({
-            **org_filter,
-            "taskType": "no answer",
-            "status": {"$in": ["completed", "done", "closed", "finished"]}
-        })
-
-        awaiting_call_count = await tasks_collection.count_documents({
-            **org_filter,
-            "taskType": "Awaiting Call",
-            "status": {"$in": ["completed", "done", "closed", "finished"]}
-        })
-
-        pipeline = [
-            {
-                "$match": {
-                    **org_filter,
-                    "$or": [
-                        {"followup_date": {"$gte": start, "$lte": end}},
-                        {"completedAt": {"$gte": start, "$lte": end}},
-                        {"createdAt": {"$gte": start, "$lte": end}}
-                    ]
-                }
-            },
-            {
-                "$addFields": {
-                    "task_type": {"$ifNull": ["$taskType", "Uncategorized"]},
-                    "is_excluded": {
-                        "$cond": [
-                            {"$and": [{"$ne": ["$taskType", None]}, {"$in": ["$taskType", EXCLUDED_TASK_TYPES_FROM_COMPLETED]}]},
-                            True, False
-                        ]
-                    },
-                    "is_completed": {
-                        "$cond": [
-                            {
-                                "$and": [
-                                    {"$in": [{"$toLower": {"$ifNull": ["$status", "pending"]}}, ["completed", "done", "closed", "finished"]]},
-                                    {"$not": {"$cond": [{"$and": [{"$ne": ["$taskType", None]}, {"$in": ["$taskType", EXCLUDED_TASK_TYPES_FROM_COMPLETED]}]}, True, False]}}
-                                ]
-                            },
-                            True, False
-                        ]
-                    },
-                    "completed_in_period": {
-                        "$cond": [
-                            {
-                                "$and": [
-                                    {"$ne": ["$completedAt", None]},
-                                    {"$gte": ["$completedAt", start]},
-                                    {"$lte": ["$completedAt", end]},
-                                    {"$in": [{"$toLower": {"$ifNull": ["$status", "pending"]}}, ["completed", "done", "closed", "finished"]]},
-                                    {"$not": {"$cond": [{"$and": [{"$ne": ["$taskType", None]}, {"$in": ["$taskType", EXCLUDED_TASK_TYPES_FROM_COMPLETED]}]}, True, False]}}
-                                ]
-                            },
-                            True, False
-                        ]
-                    }
-                }
-            },
-            {
-                "$group": {
-                    "_id": "$task_type",
-                    "total": {"$sum": 1},
-                    "completed": {"$sum": {"$cond": ["$is_completed", 1, 0]}},
-                    "completed_in_period": {"$sum": {"$cond": ["$completed_in_period", 1, 0]}},
-                    "due_in_period": {"$sum": {"$cond": [{"$and": [{"$ne": ["$followup_date", None]}, {"$gte": ["$followup_date", start]}, {"$lte": ["$followup_date", end]}]}, 1, 0]}},
-                    "is_excluded": {"$first": "$is_excluded"}
-                }
-            },
-            {"$sort": {"total": -1}}
-        ]
-
-        task_type_cursor = tasks_collection.aggregate(pipeline)
-        task_type_stats_raw = await task_type_cursor.to_list(None)
-
-        task_type_stats = {}
-        for stat in task_type_stats_raw:
-            task_type = stat["_id"] or "Uncategorized"
-            task_type_stats[task_type] = {
-                "total": stat["total"],
-                "completed": stat["completed"],
-                "completed_in_period": stat["completed_in_period"],
-                "due_in_period": stat["due_in_period"],
-                "is_excluded": stat["is_excluded"],
-                "completion_rate": round((stat["completed"] / stat["total"] * 100), 2) if stat["total"] > 0 else 0,
-                "completion_rate_in_period": round((stat["completed_in_period"] / stat["due_in_period"] * 100), 2) if stat["due_in_period"] > 0 else 0
-            }
-
-        overdue_cells_count = await events_collection.count_documents({
-            **org_filter,
-            "$or": [
-                {"Event Type": {"$regex": "^Cells$", "$options": "i"}},
-                {"eventType": {"$regex": "^Cells$", "$options": "i"}},
-                {"eventTypeName": {"$regex": "^Cells$", "$options": "i"}}
-            ],
-            "date": {"$lte": end},
-            "$or": [
-                {"status": "incomplete"},
-                {"status": {"$exists": False}},
-                {"Status": "Incomplete"},
-                {"_is_overdue": True}
-            ]
-        })
-
-        return {
-            "period": period,
-            "date_range": {"start": start_str, "end": end_str},
-            "taskCount": total_tasks_all,
-            "tasksDueInPeriod": tasks_due_in_period,
-            "tasksCompletedInPeriod": tasks_completed_in_period,
-            "totalCompletedTasks": total_completed,
-            "consolidationTasks": total_consolidation_tasks,
-            "consolidationCompleted": total_consolidation_completed,
-            "consolidationCompletedInPeriod": consolidation_completed_in_period,
-            "consolidationCompletionRate": round((total_consolidation_completed / total_consolidation_tasks * 100), 2) if total_consolidation_tasks > 0 else 0,
-            "overdueCells": overdue_cells_count,
-            "completionRateDueTasks": round((tasks_completed_in_period / tasks_due_in_period * 100), 2) if tasks_due_in_period > 0 else 0,
-            "overallCompletionRate": round((total_completed / total_tasks_all * 100), 2) if total_tasks_all > 0 else 0,
-            "taskTypeBreakdown": task_type_stats,
-            "totalTaskTypesFound": len(task_type_stats),
-            "excludedTaskTypes": EXCLUDED_TASK_TYPES_FROM_COMPLETED,
-            "timestamp": datetime.utcnow().isoformat(),
-            "note": "'no answer' and 'Awaiting Call' task types are excluded from completed counts"
-        }
-
+        return await asyncio.to_thread(sb_get_dashboard_quick, period, org_filter)
     except Exception as e:
-        import traceback
         traceback.print_exc()
-        raise HTTPException(500, f"Error fetching quick stats: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error fetching quick stats: {str(e)}")
             
 @app.patch("/events/{event_id}/toggle-status")
 async def toggle_event_status(
@@ -13636,180 +12802,180 @@ async def toggle_event_status(
         print(f"Error toggling event status: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error toggling event status: {str(e)}")
      
-@app.post("/service-checkin/create-consolidation")
-async def create_consolidation(
-    consolidation_data: dict = Body(...),
-    current_user: dict = Depends(get_current_user)
-):
-    try:
-        event_id = consolidation_data.get("event_id")
-        person_data = consolidation_data.get("person_data", {})
-        decision_type = consolidation_data.get("decision_type", "Commitment")
-        assigned_to = consolidation_data.get("assigned_to", "")
-        notes = consolidation_data.get("notes", "")
+# @app.post("/service-checkin/create-consolidation")
+# async def create_consolidation(
+#     consolidation_data: dict = Body(...),
+#     current_user: dict = Depends(get_current_user)
+# ):
+#     try:
+#         event_id = consolidation_data.get("event_id")
+#         person_data = consolidation_data.get("person_data", {})
+#         decision_type = consolidation_data.get("decision_type", "Commitment")
+#         assigned_to = consolidation_data.get("assigned_to", "")
+#         notes = consolidation_data.get("notes", "")
 
-        if not event_id:
-            raise HTTPException(status_code=400, detail="Event ID is required")
+#         if not event_id:
+#             raise HTTPException(status_code=400, detail="Event ID is required")
 
-        # Handle recurring event ID (split base_id from date)
-        parts = event_id.split("_")
-        base_event_id = parts[0]
-        instance_date = parts[1] if len(parts) > 1 else None
+#         # Handle recurring event ID (split base_id from date)
+#         parts = event_id.split("_")
+#         base_event_id = parts[0]
+#         instance_date = parts[1] if len(parts) > 1 else None
 
-        if not ObjectId.is_valid(base_event_id):
-            raise HTTPException(status_code=400, detail="Invalid event ID format")
+#         if not ObjectId.is_valid(base_event_id):
+#             raise HTTPException(status_code=400, detail="Invalid event ID format")
 
-        event = await events_collection.find_one({"_id": ObjectId(base_event_id)})
-        if not event:
-            raise HTTPException(status_code=404, detail="Event not found")
+#         event = await events_collection.find_one({"_id": ObjectId(base_event_id)})
+#         if not event:
+#             raise HTTPException(status_code=404, detail="Event not found")
 
-        is_recurring = bool(event.get("recurring_day"))
+#         is_recurring = bool(event.get("recurring_day"))
 
-        # If recurring and no date provided, use today (Joburg time)
-        if is_recurring and not instance_date:
-            timezone = pytz.timezone("Africa/Johannesburg")
-            instance_date = datetime.now(timezone).date().isoformat()
+#         # If recurring and no date provided, use today (Joburg time)
+#         if is_recurring and not instance_date:
+#             timezone = pytz.timezone("Africa/Johannesburg")
+#             instance_date = datetime.now(timezone).date().isoformat()
 
-        person_name = person_data.get("name", "")
-        person_surname = person_data.get("surname", "")
-        person_email = person_data.get("email", "")
-        person_phone = person_data.get("phone", "") or person_data.get("number", "")
-        person_id = person_data.get("id", "")
+#         person_name = person_data.get("name", "")
+#         person_surname = person_data.get("surname", "")
+#         person_email = person_data.get("email", "")
+#         person_phone = person_data.get("phone", "") or person_data.get("number", "")
+#         person_id = person_data.get("id", "")
 
-        # Create task
-        task_payload = {
-            "memberID": current_user.get("user_id", current_user.get("email", "unknown")),
-            "name": assigned_to or current_user.get("name", "Unknown"),
-            "taskType": "consolidation",
-            "contacted_person": {
-                "name": f"{person_name} {person_surname}".strip(),
-                "phone": person_phone,
-                "email": person_email
-            },
-            "followup_date": datetime.utcnow().isoformat(),
-            "status": "Open",
-            "type": "consolidation",
-            "assignedfor": consolidation_data.get("assigned_to_email") or current_user.get("email", "unknown"),
-            "assigned_to_email": consolidation_data.get("assigned_to_email") or "",
-            "is_consolidation_task": True,
-            "leader_assigned": assigned_to,
-            "leader_name": assigned_to,
-            "consolidation_name": f"{person_name} {person_surname} - {consolidation_data.get('decision_type', 'Commitment')}",
-            "decision_display_name": consolidation_data.get("decision_type", "Commitment"),
-            "source_display": "Service",
-            "consolidation_source": "Service",
-            "person_name": person_name,
-            "person_surname": person_surname,
-            "person_email": person_email,
-            "person_phone": person_phone,
-            "person_id": person_id,
-            "Organization": current_user.get("Organization") or current_user.get("organization", ""),
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat()
-        }
+#         # Create task
+#         task_payload = {
+#             "memberID": current_user.get("user_id", current_user.get("email", "unknown")),
+#             "name": assigned_to or current_user.get("name", "Unknown"),
+#             "taskType": "consolidation",
+#             "contacted_person": {
+#                 "name": f"{person_name} {person_surname}".strip(),
+#                 "phone": person_phone,
+#                 "email": person_email
+#             },
+#             "followup_date": datetime.utcnow().isoformat(),
+#             "status": "Open",
+#             "type": "consolidation",
+#             "assignedfor": consolidation_data.get("assigned_to_email") or current_user.get("email", "unknown"),
+#             "assigned_to_email": consolidation_data.get("assigned_to_email") or "",
+#             "is_consolidation_task": True,
+#             "leader_assigned": assigned_to,
+#             "leader_name": assigned_to,
+#             "consolidation_name": f"{person_name} {person_surname} - {consolidation_data.get('decision_type', 'Commitment')}",
+#             "decision_display_name": consolidation_data.get("decision_type", "Commitment"),
+#             "source_display": "Service",
+#             "consolidation_source": "Service",
+#             "person_name": person_name,
+#             "person_surname": person_surname,
+#             "person_email": person_email,
+#             "person_phone": person_phone,
+#             "person_id": person_id,
+#             "Organization": current_user.get("Organization") or current_user.get("organization", ""),
+#             "created_at": datetime.utcnow().isoformat(),
+#             "updated_at": datetime.utcnow().isoformat()
+#         }
 
-        task_result = await tasks_collection.insert_one(task_payload)
-        task_id = str(task_result.inserted_id)
+#         task_result = await tasks_collection.insert_one(task_payload)
+#         task_id = str(task_result.inserted_id)
 
-        consolidation_id = str(ObjectId())
-        consolidation_record = {
-            "id": consolidation_id,
-            "task_id": task_id,
-            "event_id": event_id,
-            "person_id": person_id,
-            "person_name": person_name,
-            "person_surname": person_surname,
-            "person_email": person_email,
-            "person_phone": person_phone,
-            "decision_type": decision_type,
-            "assigned_to": assigned_to,
-            "notes": notes,
-            "created_by": current_user.get("email", "unknown"),
-            "created_by_name": current_user.get("name", "Unknown"),
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat(),
-            "status": "active",
-            "source": "service_checkin"
-        }
+#         consolidation_id = str(ObjectId())
+#         consolidation_record = {
+#             "id": consolidation_id,
+#             "task_id": task_id,
+#             "event_id": event_id,
+#             "person_id": person_id,
+#             "person_name": person_name,
+#             "person_surname": person_surname,
+#             "person_email": person_email,
+#             "person_phone": person_phone,
+#             "decision_type": decision_type,
+#             "assigned_to": assigned_to,
+#             "notes": notes,
+#             "created_by": current_user.get("email", "unknown"),
+#             "created_by_name": current_user.get("name", "Unknown"),
+#             "created_at": datetime.utcnow().isoformat(),
+#             "updated_at": datetime.utcnow().isoformat(),
+#             "status": "active",
+#             "source": "service_checkin"
+#         }
 
-        # ── Write to the correct location based on recurring vs non-recurring ──
-        if is_recurring:
-            # Push into the nested attendance[date].consolidations array
-            result = await events_collection.update_one(
-                {"_id": ObjectId(base_event_id)},
-                {
-                    "$push": {f"attendance.{instance_date}.consolidations": consolidation_record},
-                    "$set": {"updated_at": datetime.utcnow().isoformat()}
-                }
-            )
-        else:
-            # Push into the root consolidations array (original behaviour)
-            result = await events_collection.update_one(
-                {"_id": ObjectId(base_event_id)},
-                {
-                    "$push": {"consolidations": consolidation_record},
-                    "$set": {"updated_at": datetime.utcnow().isoformat()}
-                }
-            )
+#         # ── Write to the correct location based on recurring vs non-recurring ──
+#         if is_recurring:
+#             # Push into the nested attendance[date].consolidations array
+#             result = await events_collection.update_one(
+#                 {"_id": ObjectId(base_event_id)},
+#                 {
+#                     "$push": {f"attendance.{instance_date}.consolidations": consolidation_record},
+#                     "$set": {"updated_at": datetime.utcnow().isoformat()}
+#                 }
+#             )
+#         else:
+#             # Push into the root consolidations array (original behaviour)
+#             result = await events_collection.update_one(
+#                 {"_id": ObjectId(base_event_id)},
+#                 {
+#                     "$push": {"consolidations": consolidation_record},
+#                     "$set": {"updated_at": datetime.utcnow().isoformat()}
+#                 }
+#             )
 
-        if result.modified_count == 0:
-            await tasks_collection.delete_one({"_id": ObjectId(task_id)})
-            raise HTTPException(status_code=500, detail="Failed to add consolidation to event")
+#         if result.modified_count == 0:
+#             await tasks_collection.delete_one({"_id": ObjectId(task_id)})
+#             raise HTTPException(status_code=500, detail="Failed to add consolidation to event")
 
-        # Also save to consolidations collection
-        try:
-            consolidations_collection = db["consolidations"]
-            await consolidations_collection.insert_one(
-                {**consolidation_record, "_id": ObjectId(consolidation_id)}
-            )
-        except Exception as e:
-            logger.warning(f"Could not add to consolidations collection: {e}")
+#         # Also save to consolidations collection
+#         try:
+#             consolidations_collection = db["consolidations"]
+#             await consolidations_collection.insert_one(
+#                 {**consolidation_record, "_id": ObjectId(consolidation_id)}
+#             )
+#         except Exception as e:
+#             logger.warning(f"Could not add to consolidations collection: {e}")
 
-        try:
-            await log_activity(
-                user_id=current_user.get("user_id", current_user.get("email", "unknown")),
-                action="CONSOLIDATION_CREATED",
-                details=f"Created consolidation for '{person_name} {person_surname}' in event '{event.get('eventName', 'Unknown')}'"
-            )
-        except Exception as e:
-            logger.warning(f"Failed to log activity: {e}")
+#         try:
+#             await log_activity(
+#                 user_id=current_user.get("user_id", current_user.get("email", "unknown")),
+#                 action="CONSOLIDATION_CREATED",
+#                 details=f"Created consolidation for '{person_name} {person_surname}' in event '{event.get('eventName', 'Unknown')}'"
+#             )
+#         except Exception as e:
+#             logger.warning(f"Failed to log activity: {e}")
 
-        updated_event = await events_collection.find_one({"_id": ObjectId(base_event_id)})
+#         updated_event = await events_collection.find_one({"_id": ObjectId(base_event_id)})
 
-        # Get correct count based on recurring
-        if is_recurring:
-            attendance_data = updated_event.get("attendance", {})
-            date_data = attendance_data.get(instance_date, {})
-            cons_count = len(date_data.get("consolidations", []))
-        else:
-            cons_count = len(updated_event.get("consolidations", []))
+#         # Get correct count based on recurring
+#         if is_recurring:
+#             attendance_data = updated_event.get("attendance", {})
+#             date_data = attendance_data.get(instance_date, {})
+#             cons_count = len(date_data.get("consolidations", []))
+#         else:
+#             cons_count = len(updated_event.get("consolidations", []))
 
-        return {
-            "success": True,
-            "message": "Consolidation created successfully",
-            "consolidation": consolidation_record,
-            "task_id": task_id,
-            "event_id": event_id,
-            "event_name": event.get("eventName", "Unknown Event"),
-            "updated_statistics": {
-                "consolidations_count": cons_count,
-            },
-            "timestamp": datetime.utcnow().isoformat()
-        }
+#         return {
+#             "success": True,
+#             "message": "Consolidation created successfully",
+#             "consolidation": consolidation_record,
+#             "task_id": task_id,
+#             "event_id": event_id,
+#             "event_name": event.get("eventName", "Unknown Event"),
+#             "updated_statistics": {
+#                 "consolidations_count": cons_count,
+#             },
+#             "timestamp": datetime.utcnow().isoformat()
+#         }
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error creating consolidation: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         logger.error(f"Error creating consolidation: {str(e)}", exc_info=True)
+#         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-@app.delete("/service-checkin/remove-consolidation")
-async def remove_consolidation(
-    event_id: str = Query(...),
-    consolidation_id: str = Query(...),
-    keep_person_in_attendees: bool = Query(True),
-    current_user: dict = Depends(get_current_user)
-):
+# @app.delete("/service-checkin/remove-consolidation")
+# async def remove_consolidation(
+#     event_id: str = Query(...),
+#     consolidation_id: str = Query(...),
+#     keep_person_in_attendees: bool = Query(True),
+#     current_user: dict = Depends(get_current_user)
+# ):
     try:
         # Strip date suffix to get base ObjectId
         parts = event_id.split("_")
@@ -13937,10 +13103,10 @@ async def remove_consolidation(
         logger.error(f"Error removing consolidation: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.post("/service-checkin/migrate-consolidations")
-async def migrate_consolidations(
-    current_user: dict = Depends(get_current_user)
-):
+# @app.post("/service-checkin/migrate-consolidations")
+# async def migrate_consolidations(
+#     current_user: dict = Depends(get_current_user)
+# ):
     """
     Migration endpoint to add task_id to existing consolidations
     Run this once to fix old consolidations
@@ -14041,11 +13207,11 @@ async def migrate_consolidations(
 
 
 # ==================== DEBUG: CHECK CONSOLIDATIONS ====================
-@app.get("/service-checkin/debug-consolidations")
-async def debug_consolidations(
-    event_id: str = Query(None, description="Event ID (optional)"),
-    current_user: dict = Depends(get_current_user)
-):
+# @app.get("/service-checkin/debug-consolidations")
+# async def debug_consolidations(
+#     event_id: str = Query(None, description="Event ID (optional)"),
+#     current_user: dict = Depends(get_current_user)
+# ):
     """
     Debug endpoint to check consolidation data structure
     """
