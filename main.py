@@ -9629,6 +9629,15 @@ async def create_task(task: TaskModel, current_user: dict = Depends(get_current_
         new_task_dict = task.dict()
         
         # Only set assignedfor if not already provided by frontend
+        if "leader_name" in new_task_dict:
+            new_task_dict["leader_name"] = new_task_dict["leader_name"]
+
+        if "leader_assigned" in new_task_dict:
+            leader_assigned = new_task_dict["leader_assigned"]
+            new_task_dict["leader_assigned"] = leader_assigned.lower() if isinstance(leader_assigned, str) else leader_assigned
+
+        if "assignedTo" in new_task_dict:
+            new_task_dict["assignedTo"] = new_task_dict["assignedTo"]
         if new_task_dict.get("assignedfor"):
             new_task_dict["assignedfor"] = new_task_dict["assignedfor"].lower()
         else:
@@ -9700,7 +9709,7 @@ async def get_my_special_tasks(
                         {"assignedfor": email_regex},
                         {"assigned_to_email": email_regex},
                         {"leader_name": user_name},
-                        {"leader_assigned": user_name},
+                        {"leader_assigned": email_regex},
                         {"created_by": email_regex}
                     ]
                 }
@@ -9845,6 +9854,7 @@ async def get_user_tasks(
             query = {
                 "Organization": org_name,   # always scope to org
                 "$or": [
+                    {"leader_assigned": email_regex},
                     {"assignedfor": email_regex},
                     {"assigned_to_email": email_regex},
                     {"created_by_email": email_regex},   # catches tasks user created
@@ -10115,13 +10125,8 @@ async def delete_task_type(
 # ====================== PUT /tasks ======================
 
 @app.put("/tasks/{task_id}")
-async def update_task(
-    task_id: str,
-    updated_task: dict,
-    current_user: dict = Depends(get_current_user)
-):
+async def update_task(task_id: str, updated_task: dict, current_user: dict = Depends(get_current_user)):
     try:
-        # Extract organization name from current user
         org_name = None
         for key in current_user.keys():
             if key.lower() == "organization":
@@ -10133,23 +10138,32 @@ async def update_task(
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
 
-        # === CROSS-TENANT PROTECTION ===
-        task_org = task.get("Organization")
-        if (
-            task_org
-            and task_org.lower() != org_name.lower()
-            and current_user.get("role") != "super_admin"
-        ):
-            raise HTTPException(
-                status_code=403,
-                detail="You don't have access to this church's data."
-            )
-
-        # Prepare update data
         update_data = {}
 
         if "name" in updated_task:
             update_data["name"] = updated_task["name"]
+
+        if "assignedTo" in updated_task:
+            update_data["assignedTo"] = updated_task["assignedTo"]
+
+        if "leader_name" in updated_task:
+            update_data["leader_name"] = updated_task["leader_name"]
+
+        if "leader_assigned" in updated_task:
+            value = updated_task["leader_assigned"]
+            if isinstance(value, str):
+                update_data["leader_assigned"] = value.lower()
+            else:
+                update_data["leader_assigned"] = value
+
+        if "assignedfor" in updated_task:
+            update_data["assignedfor"] = updated_task["assignedfor"].lower()
+
+        if "assigned_to_email" in updated_task:
+            update_data["assigned_to_email"] = updated_task["assigned_to_email"].lower()
+
+        if "is_consolidation_task" in updated_task:
+            update_data["is_consolidation_task"] = bool(updated_task["is_consolidation_task"])
 
         if "taskType" in updated_task:
             update_data["taskType"] = updated_task["taskType"]
@@ -10158,13 +10172,9 @@ async def update_task(
             update_data["contacted_person"] = updated_task["contacted_person"]
 
         if "followup_date" in updated_task:
-            try:
-                update_data["followup_date"] = updated_task["followup_date"]
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"Invalid date format: {str(e)}")
+            update_data["followup_date"] = updated_task["followup_date"]
 
         if "status" in updated_task:
-            # Always normalize status to lowercase
             normalized_status = updated_task["status"].lower()
             update_data["status"] = normalized_status
 
@@ -10176,28 +10186,9 @@ async def update_task(
         if "type" in updated_task:
             update_data["type"] = updated_task["type"]
 
-        if "assignedfor" in updated_task:
-            # Always normalize assignedfor to lowercase
-            update_data["assignedfor"] = updated_task["assignedfor"].lower()
-
-        if "assigned_to_email" in updated_task:
-            update_data["assigned_to_email"] = updated_task["assigned_to_email"].lower()
-
-        # Add updated timestamp
         update_data["updated_at"] = datetime.utcnow().isoformat()
 
-        # Perform update
-        result = await db["tasks"].update_one(
-            {"_id": obj_id},
-            {"$set": update_data}
-        )
-
-        if result.modified_count == 0:
-            if result.matched_count > 0:
-                updated_task_in_db = await db["tasks"].find_one({"_id": obj_id})
-                return {"updatedTask": serialize_doc(updated_task_in_db)}
-            else:
-                raise HTTPException(status_code=404, detail="Task not found")
+        result = await db["tasks"].update_one({"_id": obj_id}, {"$set": update_data})
 
         updated_task_in_db = await db["tasks"].find_one({"_id": obj_id})
         return {"updatedTask": serialize_doc(updated_task_in_db)}
@@ -10205,7 +10196,7 @@ async def update_task(
     except Exception as e:
         print(f"Error updating task: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
+    
 from collections import defaultdict
 
 @app.get("/stats/overview")
