@@ -41,8 +41,7 @@ app.add_middleware(
         "https://teams.theactivechurch.org",
         "http://localhost:8000",
         "http://localhost:5173",  
-        "https://new-active-teams.netlify.app",
-        "https://activeteams.netlify.app",
+        "https://test-active-teams.netlify.app",
         "https://activeteamsbackend2.0.onrender.com"
     ],
     allow_credentials=True,
