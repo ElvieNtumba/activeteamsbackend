@@ -37,6 +37,7 @@ from supabase_helpers.supabase_stats import (
     sb_get_dashboard_comprehensive,
 )
 from supabase_helpers.service_checkin_routes import router as service_checkin_router
+from fastapi.responses import StreamingResponse
 
 import pandas as pd
 import io
@@ -12124,6 +12125,52 @@ async def get_dashboard_quick_stats(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error fetching quick stats: {str(e)}")
             
+
+
+@app.get("/stats/export-cells-excel")
+async def export_cells_excel(
+    start_date: str = Query(..., description="Start date YYYY-MM-DD"),
+    end_date:   str = Query(..., description="End date   YYYY-MM-DD"),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Stream a Cells Attendance .xlsx workbook for the given date range.
+ 
+    Rows: TOTAL CELL ATTENDANCE and TOTAL NO. OF CELLS, one column per week.
+    Includes an embedded dual-line chart (blue = attendance, red = cell count).
+    """
+    import traceback as _tb
+    from supabase_helpers.excel_export import build_cells_excel
+    from fastapi.responses import StreamingResponse
+ 
+    org_filter = _build_stats_org_filter(current_user)
+ 
+    try:
+        excel_bytes = await asyncio.to_thread(
+            build_cells_excel, org_filter, start_date, end_date
+        )
+    except Exception as exc:
+        # Log the full traceback so it appears in the server console
+        _tb.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Excel generation failed: {exc}",
+        )
+ 
+    filename = f"cells_attendance_{start_date}_to_{end_date}.xlsx"
+ 
+    return StreamingResponse(
+        io.BytesIO(excel_bytes),
+        media_type=(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}",
+            "Access-Control-Expose-Headers": "Content-Disposition",
+        },
+    )
+
+
 @app.patch("/events/{event_id}/toggle-status")
 async def toggle_event_status(
     event_id: str,
