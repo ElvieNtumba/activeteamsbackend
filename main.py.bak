@@ -32,16 +32,13 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from time import sleep
 from supreme_admin import router as supreme_admin_router
 from contextlib import asynccontextmanager
-from daily_tasks import router as tasks_router
-from task_types import router as task_types_router
 
 oauth2_scheme = HTTPBearer()
 
 #add routers here:
 def include_router(app):
-    # Task endpoints (Supabase-backed)
-    app.include_router(tasks_router)
-    app.include_router(task_types_router)
+    #app.include_router(events_router)
+    pass
 
 def start_application():
     app = FastAPI()
@@ -9531,6 +9528,596 @@ async def get_leaders_only():
 # ====================== POST /tasks ======================
 
 from fastapi.encoders import jsonable_encoder
+
+@app.post("/tasks")
+async def create_task(task: TaskModel, current_user: dict = Depends(get_current_user)):
+    try:
+        organization = None
+        for key in current_user.keys():
+            if key.lower() == "organization":
+                organization = current_user[key]
+                break
+
+        new_task_dict = task.dict()
+        
+        # Only set assignedfor if not already provided by frontend
+        if new_task_dict.get("assignedfor"):
+            new_task_dict["assignedfor"] = new_task_dict["assignedfor"].lower()
+        else:
+            new_task_dict["assignedfor"] = current_user["email"].lower()
+
+        if not new_task_dict.get("assigned_to_email"):
+            new_task_dict["assigned_to_email"] = new_task_dict["assignedfor"]
+
+        # Always track creator
+        new_task_dict["created_by_email"] = current_user["email"].lower()
+        new_task_dict["created_by_name"] = f"{current_user.get('name', '')} {current_user.get('surname', '')}".strip()
+        new_task_dict["createdAt"] = datetime.utcnow()
+        new_task_dict["Organization"] = organization
+
+        result = await db["tasks"].insert_one(new_task_dict)
+        new_task_dict["_id"] = str(result.inserted_id)
+        return {"status": "success", "task": jsonable_encoder(new_task_dict)}
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ====================== GET /tasks ======================
+
+@app.get("/tasks/my-special-tasks")
+async def get_my_special_tasks(
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        org_name = None
+        for key in current_user.keys():
+            if key.lower() == "organization":
+                org_name = current_user[key]
+                break
+
+        if not org_name:
+            raise HTTPException(status_code=403, detail="No organization found")
+
+        user_email = current_user.get("email", "").strip().lower()
+        user_name = f"{current_user.get('name', '')} {current_user.get('surname', '')}".strip()
+        timezone = pytz.timezone("Africa/Johannesburg")
+
+        email_regex = {"$regex": f"^{re.escape(user_email)}$", "$options": "i"}
+
+        query = {
+            "$and": [
+                # 1. Organization Scope: Match org_name OR allow cell tasks that lack the field entirely
+                {
+                    "$or": [
+                        {"Organization": org_name},
+                        {"Organization": {"$exists": False}},
+                        {"Organization": None}
+                    ]
+                },
+                # 2. Task Category Scope: Match any consolidation or special task criteria
+                {
+                    "$or": [
+                        {"taskType": {"$regex": "^consolidation$", "$options": "i"}},
+                        {"taskType": {"$regex": "^service follow up$", "$options": "i"}},
+                        {"taskType": {"$regex": "^cell consolidation$", "$options": "i"}},
+                        {"is_consolidation_task": True},
+                        {"is_new_person_task": True},
+                        {"consolidation_source": "cell_consolidation"},
+                        {"source": "cell_consolidation"}  # Added to match raw cell schema
+                    ]
+                },
+                # 3. Ownership Scope: Must be assigned to or created by this user
+                {
+                    "$or": [
+                        {"assignedfor": email_regex},
+                        {"assigned_to_email": email_regex},
+                        {"leader_name": user_name},
+                        {"leader_assigned": user_name},
+                        {"created_by": email_regex}
+                    ]
+                }
+            ]
+        }
+
+        cursor = tasks_collection.find(query).sort("followup_date", -1).limit(200)
+        all_tasks = []
+
+        async for task in cursor:
+            task_date_raw = task.get("followup_date")
+            task_datetime = None
+
+            if task_date_raw:
+                try:
+                    if isinstance(task_date_raw, datetime):
+                        task_datetime = task_date_raw.astimezone(timezone)
+                    elif isinstance(task_date_raw, str):
+                        task_datetime = datetime.fromisoformat(
+                            task_date_raw.replace("Z", "+00:00")
+                        ).astimezone(timezone)
+                    elif isinstance(task_date_raw, dict) and "$date" in task_date_raw:
+                        task_datetime = datetime.fromisoformat(
+                            str(task_date_raw["$date"]).replace("Z", "+00:00")
+                        ).astimezone(timezone)
+                except (ValueError, TypeError, AttributeError) as e:
+                    logging.warning(f"Could not parse followup_date '{task_date_raw}': {e}")
+                    task_datetime = None
+
+            task_type_raw = task.get("taskType", "")
+            task_type_lower = task_type_raw.lower()
+
+            # Ensure both fallback field variants determine consolidation flags accurately
+            is_consolidation = (
+                bool(task.get("is_consolidation_task")) or
+                task_type_lower in ("consolidation", "cell consolidation") or
+                task.get("consolidation_source") == "cell_consolidation" or
+                task.get("source") == "cell_consolidation"
+            )
+            is_new_person = (
+                bool(task.get("is_new_person_task")) or
+                task_type_lower in ("service follow up", "new_person", "new person") or
+                task.get("source") == "service_consolidation"
+            )
+
+            completed_at = task.get("completedAt")
+            created_at = task.get("createdAt") or task.get("created_at")
+
+            def fmt_date(d):
+                if isinstance(d, datetime):
+                    return d.isoformat()
+                if isinstance(d, str):
+                    return d
+                return ""
+
+            all_tasks.append({
+                "_id": str(task["_id"]),
+                "name": task.get("name", ""),
+                "taskType": task_type_raw,
+                "consolidation_source": task.get("consolidation_source") or task.get("source") or "manual",
+                "source_display": task.get("source_display", "Manual"),
+                "followup_date": task_datetime.isoformat() if task_datetime else None,
+                "status": task.get("status", "Open"),
+                "assignedfor": task.get("assignedfor", ""),
+                "assigned_to_email": task.get("assigned_to_email", ""),
+                "created_by_email": task.get("created_by_email", ""),
+                "created_by_name": task.get("created_by_name", ""),
+                "leader_name": task.get("leader_name", ""),
+                "leader_assigned": task.get("leader_assigned", ""),
+                "type": task.get("type", "consolidation"),
+                "contacted_person": task.get("contacted_person", {}),
+                "isRecurring": bool(task.get("recurring_day")),
+                "is_consolidation_task": is_consolidation,
+                "is_new_person_task": is_new_person,
+                "decision_date": task.get("decision_date", ""),
+                "decision_display_name": task.get("decision_display_name", ""),
+                "person_name": task.get("person_name", ""),
+                "person_surname": task.get("person_surname", ""),
+                "completedAt": fmt_date(completed_at),
+                "createdAt": fmt_date(created_at),
+                "created_at": task.get("created_at", ""),
+            })
+
+        return {
+            "tasks": all_tasks,
+            "total": len(all_tasks),
+            "status": "success"
+        }
+
+    except Exception as e:
+        logging.error(f"Error in get_my_special_tasks: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/tasks")
+async def get_user_tasks(
+    email: str = Query(None),
+    assigned_to_email: str = Query(None),   # add this param
+    assignedfor: str = Query(None),          # add this param
+    userId: str = Query(None),
+    view_all: bool = Query(False),
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        org_name = None
+        for key in current_user.keys():
+            if key.lower() == "organization":
+                org_name = current_user[key]
+                break
+
+        if not org_name:
+            raise HTTPException(status_code=403, detail="You don't have access to this church's data.")
+
+        is_super_admin = current_user.get("role") == "super_admin"
+        is_leader = current_user.get("role") in ["admin", "leader", "manager", "org_admin"]
+
+        # Resolve user_email from whichever query param was provided
+        if email:
+            user_email = email.strip().lower()
+        elif assigned_to_email:
+            user_email = assigned_to_email.strip().lower()
+        elif assignedfor:
+            user_email = assignedfor.strip().lower()
+        elif userId:
+            user = await users_collection.find_one({"_id": ObjectId(userId)})
+            user_email = user.get("email", "").lower() if user else ""
+        else:
+            user_email = current_user.get("email", "").lower()
+
+        if not user_email and not (is_leader and view_all):
+            return {"error": "User email not found", "status": "failed"}
+
+        user_name = f"{current_user.get('name', '')} {current_user.get('surname', '')}".strip()
+        timezone = pytz.timezone("Africa/Johannesburg")
+
+        if is_super_admin and view_all:
+            query = {}
+        elif is_leader and view_all:
+            query = {"Organization": org_name}
+        else:
+            # Case-insensitive email match using regex
+            email_regex = {"$regex": f"^{re.escape(user_email)}$", "$options": "i"}
+            query = {
+                "Organization": org_name,   # always scope to org
+                "$or": [
+                    {"assignedfor": email_regex},
+                    {"assigned_to_email": email_regex},
+                    {"created_by_email": email_regex},   # catches tasks user created
+                    {
+                        "$and": [
+                            {"leader_name": user_name},
+                            {"is_consolidation_task": True}
+                        ]
+                    },
+                    {
+                        "$and": [
+                            {"leader_assigned": user_name},
+                            {"is_consolidation_task": True}
+                        ]
+                    }
+                ]
+            }
+
+        cursor = tasks_collection.find(query).sort("followup_date", -1).limit(500)
+        all_tasks = []
+
+        async for task in cursor:
+            task_date_raw = task.get("followup_date")
+            task_datetime = None
+
+            if task_date_raw:
+                try:
+                    if isinstance(task_date_raw, datetime):
+                        # MongoDB native datetime (the $date object case)
+                        task_datetime = task_date_raw.astimezone(timezone)
+                    elif isinstance(task_date_raw, str):
+                        # Plain ISO string — your new tasks store it this way
+                        task_datetime = datetime.fromisoformat(
+                            task_date_raw.replace("Z", "+00:00")
+                        ).astimezone(timezone)
+                    elif isinstance(task_date_raw, dict) and "$date" in task_date_raw:
+                        # Fallback: raw extended JSON dict (shouldn't happen via motor but safe)
+                        task_datetime = datetime.fromisoformat(
+                            str(task_date_raw["$date"]).replace("Z", "+00:00")
+                        ).astimezone(timezone)
+                except (ValueError, TypeError, AttributeError) as e:
+                    logging.warning(f"Could not parse followup_date '{task_date_raw}': {e}")
+                    # Don't skip — still include the task, just without a parsed date
+                    task_datetime = None
+
+            # Resolve task type display — normalise casing
+            task_type_raw = task.get("taskType", "")
+            task_type_lower = task_type_raw.lower()
+
+            # Detect special task types regardless of casing
+            is_consolidation = bool(task.get("is_consolidation_task")) or task_type_lower == "consolidation"
+            is_new_person = (
+                task_type_lower in ("service follow up", "new_person", "new person")
+                or bool(task.get("is_new_person_task"))
+            )
+
+            all_tasks.append({
+                "_id": str(task["_id"]),
+                "name": task.get("name", "Unnamed Task"),
+                "taskType": task_type_raw,
+                "followup_date": task_datetime.isoformat() if task_datetime else None,
+                "status": task.get("status", "Open"),
+                "assignedfor": task.get("assignedfor", ""),
+                "assigned_to_email": task.get("assigned_to_email", ""),
+                "created_by_email": task.get("created_by_email", ""),
+                "created_by_name": task.get("created_by_name", ""),
+                "leader_name": task.get("leader_name", ""),
+                "leader_assigned": task.get("leader_assigned", ""),   # was missing
+                "type": task.get("type", "call"),
+                "contacted_person": task.get("contacted_person", {}),
+                "isRecurring": bool(task.get("recurring_day")),
+                "is_consolidation_task": is_consolidation,
+                "is_new_person_task": is_new_person,              # was missing
+                "consolidation_source": task.get("consolidation_source", "manual"),
+                "source_display": task.get("source_display", "Manual"),
+                # Include raw dates as fallbacks for the frontend
+                "createdAt": task.get("createdAt").isoformat() if isinstance(task.get("createdAt"), datetime) else str(task.get("createdAt", "")),
+                "completedAt": task.get("completedAt").isoformat() if isinstance(task.get("completedAt"), datetime) else str(task.get("completedAt", "")),
+                "decision_date": task.get("decision_date", ""),
+            })
+
+        all_tasks.sort(key=lambda t: t["followup_date"] or "", reverse=True)
+
+        return {
+            "user_email": "all_users" if (is_leader and view_all) else current_user.get("email"),
+            "total_tasks": len(all_tasks),
+            "tasks": all_tasks,
+            "status": "success",
+            "is_leader_view": is_leader and view_all,
+            "Organization": org_name
+        }
+
+    except Exception as e:
+        logging.error(f"Error in get_user_tasks: {e}", exc_info=True)
+        return {"error": str(e), "status": "failed"}
+
+# ====================== GET /tasktypes (NOW FETCHES BY ORGANIZATION) ======================
+
+@app.get("/tasktypes", response_model=List[TaskTypeOut])
+async def get_task_types(current_user: dict = Depends(get_current_user)):
+    try:
+        # === ROBUST ORGANIZATION LOOKUP (ignores case - same as POST) ===
+        org_name = None
+        for key in current_user.keys():
+            if key.lower() == "organization":
+                org_name = current_user[key]
+                break
+
+        if not org_name:
+            raise HTTPException(status_code=403, detail="Organization not associated with user")
+
+        is_super_admin = current_user.get("role") == "super_admin"
+
+        # Multi-tenant filter - exactly like /tasks
+        query = {} if is_super_admin else {"Organization": org_name}
+
+        cursor = tasktypes_collection.find(query).sort("name", 1)
+        types = []
+        async for t in cursor:
+            types.append(task_type_serializer(t))
+        return types
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+# ====================== POST /tasktypes (CREATES WITH ORGANIZATION) ======================
+
+@app.post("/tasktypes", response_model=TaskTypeOut)
+async def create_task_type(task: TaskTypeIn, current_user: dict = Depends(get_current_user)):
+    try:
+        if current_user.get("role") not in ["super_admin", "org_admin", "admin"]:
+            raise HTTPException(status_code=403, detail="Only admins can create task types.")
+
+        # === ROBUST ORGANIZATION LOOKUP (ignores case - same as POST) ===
+        org_name = None
+        for key in current_user.keys():
+            if key.lower() == "organization":
+                org_name = current_user[key]
+                break
+
+        if not org_name:
+            raise HTTPException(status_code=403, detail="Organization not associated with user")
+        existing = await tasktypes_collection.find_one({
+            "name": task.name,
+            "Organization": org_name
+        })
+        if existing:
+            raise HTTPException(status_code=400, detail="Task type already exists in this organization.")
+        new_task = {
+            "name": task.name,
+            "Organization": org_name
+        }
+        result = await tasktypes_collection.insert_one(new_task)
+        created = await tasktypes_collection.find_one({"_id": result.inserted_id})
+
+        return task_type_serializer(created)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+# ====================== Helper (keep exactly as before) ======================
+def serialize_doc(doc):
+    if doc and "_id" in doc:
+        doc["_id"] = str(doc["_id"])
+    return doc
+
+# ====================== PUT /tasktypes/{tasktype_id} ======================
+@app.put("/tasktypes/{tasktype_id}")
+async def update_task_type(
+    tasktype_id: str,
+    update_data: TaskTypeUpdate,         
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        if current_user.get("role") not in ["super_admin", "org_admin", "admin"]:
+            raise HTTPException(status_code=403, detail="Only admins can edit task types.")
+
+        # === ROBUST ORGANIZATION LOOKUP (ignores case - same as POST) ===
+        org_name = None
+        for key in current_user.keys():
+            if key.lower() == "organization":
+                org_name = current_user[key]
+                break
+
+        if not org_name:
+            raise HTTPException(status_code=403, detail="Organization not associated with user")
+
+        try:
+            oid = ObjectId(tasktype_id)
+        except:
+            raise HTTPException(status_code=400, detail="Invalid task type ID")
+
+        # Check ownership
+        existing = await tasktypes_collection.find_one({"_id": oid})
+        if not existing:
+            raise HTTPException(status_code=404, detail="Task type not found")
+
+        # Cross-tenant protection
+        if existing.get("Organization") != org_name and current_user.get("role") != "super_admin":
+            raise HTTPException(
+                status_code=403,
+                detail="You don't have access to this church's data."
+            )
+
+        # Update
+        updated = await tasktypes_collection.find_one_and_update(
+            {"_id": oid},
+            {"$set": {"name": update_data.name.strip()}},
+            return_document=True
+        )
+
+        if not updated:
+            raise HTTPException(status_code=404, detail="Task type not found")
+
+        updated["_id"] = str(updated["_id"])
+        return {"message": "Task type updated", "taskType": updated}
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# ====================== DELETE /tasktypes/{tasktype_id} ======================
+
+@app.delete("/tasktypes/{tasktype_id}")
+async def delete_task_type(
+    tasktype_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        # Admin-only check
+        if current_user.get("role") not in ["super_admin", "org_admin", "admin"]:
+            raise HTTPException(status_code=403, detail="Only admins can delete task types.")
+
+        # === ROBUST ORGANIZATION LOOKUP (ignores case - same as POST) ===
+        org_name = None
+        for key in current_user.keys():
+            if key.lower() == "organization":
+                org_name = current_user[key]
+                break
+
+        if not org_name:
+            raise HTTPException(status_code=403, detail="Organization not associated with user")
+
+        try:
+            oid = ObjectId(tasktype_id)
+        except:
+            raise HTTPException(status_code=400, detail="Invalid task type ID")
+
+        # Check ownership
+        existing = await tasktypes_collection.find_one({"_id": oid})
+        if not existing:
+            raise HTTPException(status_code=404, detail="Task type not found")
+
+        # Cross-tenant protection
+        if existing.get("Organization") != org_name and current_user.get("role") != "super_admin":
+            raise HTTPException(
+                status_code=403,
+                detail="You don't have access to this church's data."
+            )
+
+        deleted = await tasktypes_collection.find_one_and_delete({"_id": oid})
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Task type not found")
+
+        return {"message": "Task type deleted successfully"}
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# ====================== PUT /taskS ======================
+
+# ====================== PUT /tasks ======================
+
+@app.put("/tasks/{task_id}")
+async def update_task(
+    task_id: str,
+    updated_task: dict,
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        # Extract organization name from current user
+        org_name = None
+        for key in current_user.keys():
+            if key.lower() == "organization":
+                org_name = current_user[key]
+                break
+
+        obj_id = ObjectId(task_id)
+        task = await db["tasks"].find_one({"_id": obj_id})
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        # === CROSS-TENANT PROTECTION ===
+        task_org = task.get("Organization")
+        if (
+            task_org
+            and task_org.lower() != org_name.lower()
+            and current_user.get("role") != "super_admin"
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="You don't have access to this church's data."
+            )
+
+        # Prepare update data
+        update_data = {}
+
+        if "name" in updated_task:
+            update_data["name"] = updated_task["name"]
+
+        if "taskType" in updated_task:
+            update_data["taskType"] = updated_task["taskType"]
+
+        if "contacted_person" in updated_task:
+            update_data["contacted_person"] = updated_task["contacted_person"]
+
+        if "followup_date" in updated_task:
+            try:
+                update_data["followup_date"] = updated_task["followup_date"]
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid date format: {str(e)}")
+
+        if "status" in updated_task:
+            # Always normalize status to lowercase
+            normalized_status = updated_task["status"].lower()
+            update_data["status"] = normalized_status
+
+            if normalized_status in ["completed", "done", "closed", "finished"]:
+                update_data["completedAt"] = datetime.utcnow()
+            elif normalized_status in ["open", "pending", "incomplete"]:
+                update_data["completedAt"] = None
+
+        if "type" in updated_task:
+            update_data["type"] = updated_task["type"]
+
+        if "assignedfor" in updated_task:
+            # Always normalize assignedfor to lowercase
+            update_data["assignedfor"] = updated_task["assignedfor"].lower()
+
+        if "assigned_to_email" in updated_task:
+            update_data["assigned_to_email"] = updated_task["assigned_to_email"].lower()
+
+        # Add updated timestamp
+        update_data["updated_at"] = datetime.utcnow().isoformat()
+
+        # Perform update
+        result = await db["tasks"].update_one(
+            {"_id": obj_id},
+            {"$set": update_data}
+        )
+
+        if result.modified_count == 0:
+            if result.matched_count > 0:
+                updated_task_in_db = await db["tasks"].find_one({"_id": obj_id})
+                return {"updatedTask": serialize_doc(updated_task_in_db)}
+            else:
+                raise HTTPException(status_code=404, detail="Task not found")
+
+        updated_task_in_db = await db["tasks"].find_one({"_id": obj_id})
+        return {"updatedTask": serialize_doc(updated_task_in_db)}
+
+    except Exception as e:
+        print(f"Error updating task: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
 from collections import defaultdict
 
 @app.get("/stats/overview")
@@ -9863,7 +10450,7 @@ async def create_user(
     except Exception as e:
         print(f"Error creating user: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error creating user: {str(e)}")
-SUPREME_ADMIN_EMAIL = "chibuzorobi738@gmail.com"
+SUPREME_ADMIN_EMAIL = "tkgenia1234@gmail.com"
 
 ROLE_HIERARCHY = {
     "registrant":2,
@@ -11096,7 +11683,135 @@ async def get_all_users():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch users: {str(e)}")
    
+@app.get("/tasks/all")
+async def get_all_tasks(
+        current_user: dict = Depends(get_current_user)
+    ):
+        """
+        Dedicated endpoint: Get ALL tasks for every user
+        Only accessible to leaders, admins, and managers
+        Used by StatsDashboard & Admin panels
+        """
+        try:
+            # Permission check — only leaders can see all tasks
+            role = current_user.get("role", "").lower()
+            if role not in ["admin", "leader", "manager"]:
+                return {
+                    "error": "Access denied. You must be a leader or admin to view all tasks.",
+                    "status": "failed"
+                }, 403
 
+            timezone = pytz.timezone("Africa/Johannesburg")
+            cursor = tasks_collection.find({})  # No filter → ALL tasks
+            all_tasks = []
+
+            async for task in cursor:
+                # Safely parse followup_date
+                followup_raw = task.get("followup_date")
+                followup_dt = None
+                if followup_raw:
+                    if isinstance(followup_raw, datetime):
+                        followup_dt = followup_raw
+                    else:
+                        try:
+                            dt_str = str(followup_raw).replace("Z", "+00:00")
+                            followup_dt = datetime.fromisoformat(dt_str)
+                        except:
+                            try:
+                                followup_dt = datetime.fromisoformat(str(followup_raw))
+                            except:
+                                logging.warning(f"Invalid date format in task {task['_id']}: {followup_raw}")
+
+                    if followup_dt:
+                        if followup_dt.tzinfo is None:
+                            followup_dt = pytz.utc.localize(followup_dt)
+                        followup_dt = followup_dt.astimezone(timezone)
+
+                # Resolve full user info for legacy assignedfor (email string)
+                assigned_to = None
+                if task.get("assignedTo") and isinstance(task["assignedTo"], dict):
+                    assigned_to = task["assignedTo"]
+                elif task.get("assignedfor"):
+                    user = await users_collection.find_one(
+                        {"email": {"$regex": f"^{task['assignedfor'].strip()}$", "$options": "i"}},
+                        {"name": 1, "surname": 1, "email": 1, "phone": 1}
+                    )
+                    if user:
+                        assigned_to = {
+                            "_id": str(user["_id"]),
+                            "name": user.get("name", ""),
+                            "surname": user.get("surname", ""),
+                            "email": user.get("email", ""),
+                            "phone": user.get("phone", "")
+                        }
+
+                all_tasks.append({
+                    "_id": str(task["_id"]),
+                    "name": task.get("name", "Unnamed Task"),
+                    "taskType": task.get("taskType", ""),
+                    "followup_date": followup_dt.isoformat() if followup_dt else None,
+                    "status": task.get("status", "Open"),
+                    "assignedfor": task.get("assignedfor", ""),
+                    "assignedTo": assigned_to,  # Fully resolved user
+                    "type": task.get("type", "call"),
+                    "contacted_person": task.get("contacted_person", {}),
+                    "isRecurring": bool(task.get("recurring_day")),
+                    "createdAt": task.get("createdAt", datetime.utcnow()).isoformat() if task.get("createdAt") else None,
+                })
+
+            # Sort newest first
+            all_tasks.sort(key=lambda x: x["followup_date"] or "9999-12-31", reverse=True)
+
+            return {
+                "total_tasks": len(all_tasks),
+                "tasks": all_tasks,
+                "status": "success",
+                "fetched_by": current_user.get("email"),
+                "role": current_user.get("role"),
+                "timestamp": datetime.now(timezone).isoformat(),
+                "message": "All tasks loaded successfully"
+            }
+
+        except Exception as e:
+            logging.error(f"Error in /tasks/all: {e}", exc_info=True)
+            return {
+                "error": "Failed to fetch all tasks",
+                "details": str(e),
+                "status": "failed"
+            }, 500        
+
+@app.get("/tasks/leader/{leader_email}")
+async def get_leader_tasks(
+    leader_email: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get all consolidation tasks assigned to a specific leader"""
+    try:
+        # Find consolidation tasks assigned to this leader
+        tasks = await tasks_collection.find({
+            "is_consolidation_task": True,
+            "$or": [
+                {"assigned_to_email": leader_email},
+                {"assignedfor": leader_email},
+                {"assignedfor": {"$regex": f"^{leader_email}$", "$options": "i"}},
+                {"leader_assigned": {"$regex": f"^{leader_email}$", "$options": "i"}}
+            ]
+        }).to_list(length=None)
+       
+        # Format response
+        formatted_tasks = []
+        for task in tasks:
+            task["_id"] = str(task["_id"])
+            formatted_tasks.append(task)
+       
+        return {
+            "leader_email": leader_email,
+            "total_tasks": len(formatted_tasks),
+            "tasks": formatted_tasks
+        }
+       
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/consolidations")
 async def get_consolidations(
@@ -12027,15 +12742,6 @@ def get_period_range(period: str):
 EXCLUDED_TASK_TYPES_FROM_COMPLETED = ["no answer", "Awaiting Call"]
 
 # ====================== COMPREHENSIVE DASHBOARD (MULTI-TENANT) ======================
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Task & Task-Type routes are handled by the dedicated routers:
-#   daily_tasks.py  →  /tasks, /tasks/all, /tasks/leader/{email},
-#                       /tasks/my-special-tasks, /tasks/cleanup-orphaned,
-#                       /stats/dashboard-quick
-#   task_types.py   →  /tasktypes  (GET / POST / PUT / DELETE)
-# Both routers are registered in include_router() above.
-# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/stats/dashboard-comprehensive")
 async def get_dashboard_comprehensive(
     period: str = Query(
@@ -12538,7 +13244,208 @@ async def get_dashboard_comprehensive(
         raise HTTPException(status_code=500, detail=f"Error fetching comprehensive stats: {str(e)}")
 
 # ====================== QUICK DASHBOARD (MULTI-TENANT) ======================
+@app.get("/stats/dashboard-quick")
+async def get_dashboard_quick_stats(
+    period: str = Query("today", regex="^(today|thisWeek|thisMonth|previous7|previousWeek|previousMonth)$"),
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        org_name = current_user.get("Organization")
+        if not org_name:
+            raise HTTPException(status_code=403, detail="Organization not associated with user")
 
+        is_super_admin = current_user.get("role") == "super_admin"
+        org_filter = {} if is_super_admin else {"Organization": org_name}
+
+        start, end = get_period_range(period)
+        start_str = start.date().isoformat()
+        end_str = end.date().isoformat()
+
+        total_tasks_all = await tasks_collection.count_documents({
+            **org_filter,
+            "$or": [
+                {"followup_date": {"$gte": start, "$lte": end}},
+                {"completedAt": {"$gte": start, "$lte": end}},
+                {"createdAt": {"$gte": start, "$lte": end}}
+            ]
+        })
+
+        tasks_due_in_period = await tasks_collection.count_documents({
+            **org_filter,
+            "followup_date": {"$gte": start, "$lte": end},
+            "status": {"$nin": ["completed", "done", "closed", "finished"]}
+        })
+
+        tasks_completed_in_period = await tasks_collection.count_documents({
+            **org_filter,
+            "completedAt": {"$gte": start, "$lte": end},
+            "status": {"$in": ["completed", "done", "closed", "finished"]},
+            "taskType": {"$nin": EXCLUDED_TASK_TYPES_FROM_COMPLETED}
+        })
+
+        total_tasks_in_period = await tasks_collection.count_documents({
+            **org_filter,
+            "$or": [
+                {"followup_date": {"$gte": start, "$lte": end}},
+                {"completedAt": {"$gte": start, "$lte": end}},
+                {"createdAt": {"$gte": start, "$lte": end}}
+            ]
+        })
+
+        total_completed = await tasks_collection.count_documents({
+            **org_filter,
+            "status": {"$in": ["completed", "done", "closed", "finished"]},
+            "taskType": {"$nin": EXCLUDED_TASK_TYPES_FROM_COMPLETED}
+        })
+
+        consolidation_completed_in_period = await tasks_collection.count_documents({
+            **org_filter,
+            "completedAt": {"$gte": start, "$lte": end},
+            "status": {"$in": ["completed", "done", "closed", "finished"]},
+            "taskType": "consolidation"
+        })
+
+        total_consolidation_tasks = await tasks_collection.count_documents({
+            **org_filter,
+            "taskType": "consolidation"
+        })
+
+        total_consolidation_completed = await tasks_collection.count_documents({
+            **org_filter,
+            "taskType": "consolidation",
+            "status": {"$in": ["completed", "done", "closed", "finished"]}
+        })
+
+        no_answer_count = await tasks_collection.count_documents({
+            **org_filter,
+            "taskType": "no answer",
+            "status": {"$in": ["completed", "done", "closed", "finished"]}
+        })
+
+        awaiting_call_count = await tasks_collection.count_documents({
+            **org_filter,
+            "taskType": "Awaiting Call",
+            "status": {"$in": ["completed", "done", "closed", "finished"]}
+        })
+
+        pipeline = [
+            {
+                "$match": {
+                    **org_filter,
+                    "$or": [
+                        {"followup_date": {"$gte": start, "$lte": end}},
+                        {"completedAt": {"$gte": start, "$lte": end}},
+                        {"createdAt": {"$gte": start, "$lte": end}}
+                    ]
+                }
+            },
+            {
+                "$addFields": {
+                    "task_type": {"$ifNull": ["$taskType", "Uncategorized"]},
+                    "is_excluded": {
+                        "$cond": [
+                            {"$and": [{"$ne": ["$taskType", None]}, {"$in": ["$taskType", EXCLUDED_TASK_TYPES_FROM_COMPLETED]}]},
+                            True, False
+                        ]
+                    },
+                    "is_completed": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$in": [{"$toLower": {"$ifNull": ["$status", "pending"]}}, ["completed", "done", "closed", "finished"]]},
+                                    {"$not": {"$cond": [{"$and": [{"$ne": ["$taskType", None]}, {"$in": ["$taskType", EXCLUDED_TASK_TYPES_FROM_COMPLETED]}]}, True, False]}}
+                                ]
+                            },
+                            True, False
+                        ]
+                    },
+                    "completed_in_period": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$ne": ["$completedAt", None]},
+                                    {"$gte": ["$completedAt", start]},
+                                    {"$lte": ["$completedAt", end]},
+                                    {"$in": [{"$toLower": {"$ifNull": ["$status", "pending"]}}, ["completed", "done", "closed", "finished"]]},
+                                    {"$not": {"$cond": [{"$and": [{"$ne": ["$taskType", None]}, {"$in": ["$taskType", EXCLUDED_TASK_TYPES_FROM_COMPLETED]}]}, True, False]}}
+                                ]
+                            },
+                            True, False
+                        ]
+                    }
+                }
+            },
+            {
+                "$group": {
+                    "_id": "$task_type",
+                    "total": {"$sum": 1},
+                    "completed": {"$sum": {"$cond": ["$is_completed", 1, 0]}},
+                    "completed_in_period": {"$sum": {"$cond": ["$completed_in_period", 1, 0]}},
+                    "due_in_period": {"$sum": {"$cond": [{"$and": [{"$ne": ["$followup_date", None]}, {"$gte": ["$followup_date", start]}, {"$lte": ["$followup_date", end]}]}, 1, 0]}},
+                    "is_excluded": {"$first": "$is_excluded"}
+                }
+            },
+            {"$sort": {"total": -1}}
+        ]
+
+        task_type_cursor = tasks_collection.aggregate(pipeline)
+        task_type_stats_raw = await task_type_cursor.to_list(None)
+
+        task_type_stats = {}
+        for stat in task_type_stats_raw:
+            task_type = stat["_id"] or "Uncategorized"
+            task_type_stats[task_type] = {
+                "total": stat["total"],
+                "completed": stat["completed"],
+                "completed_in_period": stat["completed_in_period"],
+                "due_in_period": stat["due_in_period"],
+                "is_excluded": stat["is_excluded"],
+                "completion_rate": round((stat["completed"] / stat["total"] * 100), 2) if stat["total"] > 0 else 0,
+                "completion_rate_in_period": round((stat["completed_in_period"] / stat["due_in_period"] * 100), 2) if stat["due_in_period"] > 0 else 0
+            }
+
+        overdue_cells_count = await events_collection.count_documents({
+            **org_filter,
+            "$or": [
+                {"Event Type": {"$regex": "^Cells$", "$options": "i"}},
+                {"eventType": {"$regex": "^Cells$", "$options": "i"}},
+                {"eventTypeName": {"$regex": "^Cells$", "$options": "i"}}
+            ],
+            "date": {"$lte": end},
+            "$or": [
+                {"status": "incomplete"},
+                {"status": {"$exists": False}},
+                {"Status": "Incomplete"},
+                {"_is_overdue": True}
+            ]
+        })
+
+        return {
+            "period": period,
+            "date_range": {"start": start_str, "end": end_str},
+            "taskCount": total_tasks_all,
+            "tasksDueInPeriod": tasks_due_in_period,
+            "tasksCompletedInPeriod": tasks_completed_in_period,
+            "totalCompletedTasks": total_completed,
+            "consolidationTasks": total_consolidation_tasks,
+            "consolidationCompleted": total_consolidation_completed,
+            "consolidationCompletedInPeriod": consolidation_completed_in_period,
+            "consolidationCompletionRate": round((total_consolidation_completed / total_consolidation_tasks * 100), 2) if total_consolidation_tasks > 0 else 0,
+            "overdueCells": overdue_cells_count,
+            "completionRateDueTasks": round((tasks_completed_in_period / tasks_due_in_period * 100), 2) if tasks_due_in_period > 0 else 0,
+            "overallCompletionRate": round((total_completed / total_tasks_all * 100), 2) if total_tasks_all > 0 else 0,
+            "taskTypeBreakdown": task_type_stats,
+            "totalTaskTypesFound": len(task_type_stats),
+            "excludedTaskTypes": EXCLUDED_TASK_TYPES_FROM_COMPLETED,
+            "timestamp": datetime.utcnow().isoformat(),
+            "note": "'no answer' and 'Awaiting Call' task types are excluded from completed counts"
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Error fetching quick stats: {str(e)}")
+            
 @app.patch("/events/{event_id}/toggle-status")
 async def toggle_event_status(
     event_id: str,
@@ -13111,7 +14018,93 @@ async def debug_consolidations(
         
         
 # ==================== CLEANUP ORPHANED TASKS
+@app.delete("/tasks/cleanup-orphaned")
+async def cleanup_orphaned_tasks(
+    user_email: str = Query(None, description="User email to cleanup tasks for (optional)"),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Clean up orphaned consolidation tasks that don't have corresponding consolidations
+    """
+    try:
+        query = {
+            "taskType": "consolidation",
+            "status": {"$nin": ["completed", "cancelled", "deleted"]}
+        }
+        
+        if user_email:
+            query["assignedfor"] = user_email
+        
+        # Get all active consolidation tasks
+        consolidation_tasks = await tasks_collection.find(query).to_list(None)
+        
+        deleted_count = 0
+        deleted_ids = []
+        
+        for task in consolidation_tasks:
+            task_id = str(task.get("_id"))
+            consolidation_id = task.get("consolidation_id")
+            person_email = task.get("contacted_person", {}).get("email")
+            person_name = task.get("contacted_person", {}).get("name", "")
+            
+            consolidation_exists = False
+            
+            # Check if consolidation exists in events
+            if consolidation_id:
+                # Check in events collection
+                event_with_consolidation = await events_collection.find_one({
+                    "consolidations.id": consolidation_id,
+                    "consolidations.status": {"$ne": "removed"}
+                })
+                
+                if event_with_consolidation:
+                    consolidation_exists = True
+                else:
+                    # Check in consolidations collection
+                    consolidation = await consolidations_collection.find_one({
+                        "$or": [
+                            {"_id": ObjectId(consolidation_id) if ObjectId.is_valid(consolidation_id) else None},
+                            {"id": consolidation_id}
+                        ],
+                        "status": {"$ne": "removed"}
+                    })
+                    if consolidation:
+                        consolidation_exists = True
+            
+            # Also check by person name/email
+            if not consolidation_exists and person_email:
+                # Check if person exists in any active consolidation
+                event_with_person = await events_collection.find_one({
+                    "consolidations.person_email": person_email,
+                    "consolidations.status": {"$ne": "removed"}
+                })
+                if event_with_person:
+                    consolidation_exists = True
+            
+            # If consolidation doesn't exist, delete the task
+            if not consolidation_exists:
+                delete_result = await tasks_collection.delete_one({"_id": task["_id"]})
+                if delete_result.deleted_count > 0:
+                    deleted_count += 1
+                    deleted_ids.append(task_id)
+                    logger.info(f"Deleted orphaned task {task_id} for {person_name}")
+        
+        return {
+            "success": True,
+            "message": f"Cleaned up {deleted_count} orphaned consolidation tasks",
+            "deleted_count": deleted_count,
+            "deleted_ids": deleted_ids
+        }
+        
+    except Exception as e:
+        logger.error(f"Error cleaning up orphaned tasks: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Cleanup error: {str(e)}")     
+        
+        
 
+# ─────────────────────────────────────────────────────────────
+# ORG CONFIG ENDPOINTS
+# ─────────────────────────────────────────────────────────────
 @app.get("/org-config")
 async def get_org_config(current_user: dict = Depends(get_current_user)):
     try:
