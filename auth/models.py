@@ -1,13 +1,11 @@
 from fastapi import FastAPI, HTTPException, Request, APIRouter, Body, Path
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
-from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, EmailStr, field_validator
 from enum import Enum
 from typing import Optional, List, Literal, Dict
 from datetime import datetime, date
-from bson import ObjectId
 import uuid
 from urllib.parse import unquote
 
@@ -72,9 +70,14 @@ class AttendanceSubmission(BaseModel):
     attendees: List[Attendee]
     leaderEmail: str
     leaderName: str
+    leader12: str
     did_not_meet: bool = False
     isTicketed: bool = False
     invitedBy: Optional[str] = None
+    session_id: str
+    event_id: str
+    event_name: str
+    
 
     @field_validator("attendees", mode="before")
     def validate_attendance(cls, v, info):
@@ -422,6 +425,8 @@ class ConsolidationCreate(BaseModel):
     attendance_status: str = "checked_in"
     notes: Optional[str] = ""
     source: ConsolidationSource = ConsolidationSource.MANUAL
+    person_id:str
+    session_id:str
 
 class ConsolidationTask(TaskModel):
     consolidation_id: str
