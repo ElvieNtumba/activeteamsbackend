@@ -7,7 +7,9 @@ from jose import JWTError, jwt
 from jose.exceptions import ExpiredSignatureError
 from fastapi import HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from database import users_collection, ObjectId
+from database import users_collection
+from bson import ObjectId
+from datetime import datetime
 
 # ==============================
 # CONFIG
@@ -16,7 +18,7 @@ JWT_SECRET = os.getenv("JWT_SECRET", "replace_me_with_a_strong_secret")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))  
 REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
-SUPREME_ADMIN_EMAIL = "tkgenia1234@gmail.com"
+SUPREME_ADMIN_EMAIL = "chibuzorobi738@gmail.com"
 ORG_ID_MAP = {
     "active-church": "active-teams",
     "active church": "active-teams",
@@ -258,6 +260,7 @@ def sanitize_document(doc: dict) -> dict:
     """
     Recursively convert ObjectId and other non-serializable fields.
     """
+    from bson import ObjectId
 
     def sanitize(value):
         if isinstance(value, ObjectId):
