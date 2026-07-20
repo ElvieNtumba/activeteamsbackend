@@ -11308,340 +11308,340 @@ async def get_event_summary_stats(event_id: str):
         print(f"Error calculating event stats: {e}")
         return {}
 
-@app.post("/consolidations")
-async def create_consolidation(
-    consolidation: ConsolidationCreate,
-    current_user: dict = Depends(get_current_user)
-):
-    try:
-        consolidation_id = str(ObjectId())
+# @app.post("/consolidations")
+# async def create_consolidation(
+#     consolidation: ConsolidationCreate,
+#     current_user: dict = Depends(get_current_user)
+# ):
+#     try:
+#         consolidation_id = str(ObjectId())
        
-        print(f"Creating consolidation for: {consolidation.person_name} {consolidation.person_surname}")
-        print(f"Assigned to leader: {consolidation.assigned_to} (email: {consolidation.assigned_to_email})")
-        print(f"Source: {getattr(consolidation, 'source', 'manual')}")
+#         print(f"Creating consolidation for: {consolidation.person_name} {consolidation.person_surname}")
+#         print(f"Assigned to leader: {consolidation.assigned_to} (email: {consolidation.assigned_to_email})")
+#         print(f"Source: {getattr(consolidation, 'source', 'manual')}")
        
-        # 1. Create or find the person
-        person_email = consolidation.person_email
-        if not person_email:
-            person_email = f"{consolidation.person_name.lower()}.{consolidation.person_surname.lower()}@consolidation.temp"
+#         # 1. Create or find the person
+#         person_email = consolidation.person_email
+#         if not person_email:
+#             person_email = f"{consolidation.person_name.lower()}.{consolidation.person_surname.lower()}@consolidation.temp"
        
-        existing_person = await people_collection.find_one({
-            "$or": [
-                {"Email": person_email},
-                {"Name": consolidation.person_name, "Surname": consolidation.person_surname}
-            ]
-        })
+#         existing_person = await people_collection.find_one({
+#             "$or": [
+#                 {"Email": person_email},
+#                 {"Name": consolidation.person_name, "Surname": consolidation.person_surname}
+#             ]
+#         })
        
-        person_id = None
-        if existing_person:
-            person_id = str(existing_person["_id"])
-            print(f"Found existing person: {person_id}")
-            update_data = {
-                "Stage": "Consolidate",
-                "UpdatedAt": datetime.utcnow().isoformat(),
-                "DecisionType": consolidation.decision_type.value,
-                "DecisionDate": consolidation.decision_date,
-            }
+#         person_id = None
+#         if existing_person:
+#             person_id = str(existing_person["_id"])
+#             print(f"Found existing person: {person_id}")
+#             update_data = {
+#                 "Stage": "Consolidate",
+#                 "UpdatedAt": datetime.utcnow().isoformat(),
+#                 "DecisionType": consolidation.decision_type.value,
+#                 "DecisionDate": consolidation.decision_date,
+#             }
            
-            existing_history = existing_person.get("DecisionHistory", [])
-            if consolidation.decision_type == DecisionType.RECOMMITMENT:
-                existing_history.append({
-                    "type": "recommitment",
-                    "date": consolidation.decision_date,
-                    "consolidation_id": consolidation_id,
-                    "source": getattr(consolidation, 'source', 'manual')
-                })
-                update_data["DecisionHistory"] = existing_history
-                update_data["TotalRecommitments"] = existing_person.get("TotalRecommitments", 0) + 1
-                update_data["LastDecisionDate"] = consolidation.decision_date
-            else:
-                existing_history.append({
-                    "type": "first_time",
-                    "date": consolidation.decision_date,
-                    "consolidation_id": consolidation_id,
-                    "source": getattr(consolidation, 'source', 'manual')
-                })
-                update_data["DecisionHistory"] = existing_history
-                update_data["FirstDecisionDate"] = consolidation.decision_date
-                update_data["TotalRecommitments"] = existing_person.get("TotalRecommitments", 0)
+#             existing_history = existing_person.get("DecisionHistory", [])
+#             if consolidation.decision_type == DecisionType.RECOMMITMENT:
+#                 existing_history.append({
+#                     "type": "recommitment",
+#                     "date": consolidation.decision_date,
+#                     "consolidation_id": consolidation_id,
+#                     "source": getattr(consolidation, 'source', 'manual')
+#                 })
+#                 update_data["DecisionHistory"] = existing_history
+#                 update_data["TotalRecommitments"] = existing_person.get("TotalRecommitments", 0) + 1
+#                 update_data["LastDecisionDate"] = consolidation.decision_date
+#             else:
+#                 existing_history.append({
+#                     "type": "first_time",
+#                     "date": consolidation.decision_date,
+#                     "consolidation_id": consolidation_id,
+#                     "source": getattr(consolidation, 'source', 'manual')
+#                 })
+#                 update_data["DecisionHistory"] = existing_history
+#                 update_data["FirstDecisionDate"] = consolidation.decision_date
+#                 update_data["TotalRecommitments"] = existing_person.get("TotalRecommitments", 0)
            
-            await people_collection.update_one(
-                {"_id": ObjectId(person_id)},
-                {"$set": update_data}
-            )
-        else:
-            person_doc = {
-                "Name": consolidation.person_name.strip(),
-                "Surname": consolidation.person_surname.strip(),
-                "Email": person_email,
-                "Number": consolidation.person_phone or "",
-                "Gender": "",
-                "Address": "",
-                "Birthday": "",
-                "Stage": "Consolidate",
-                "DecisionType": consolidation.decision_type.value,
-                "DecisionDate": consolidation.decision_date,
-                "Date Created": datetime.utcnow().isoformat(),
-                "UpdatedAt": datetime.utcnow().isoformat(),
-                "InvitedBy": current_user.get("email", ""),
-                "Leader @1": consolidation.leaders[0] if len(consolidation.leaders) > 0 else "",
-                "Leader @12": consolidation.leaders[1] if len(consolidation.leaders) > 1 else "",
-                "Leader @144": consolidation.leaders[2] if len(consolidation.leaders) > 2 else "",
-                "Leader @1728": consolidation.leaders[3] if len(consolidation.leaders) > 3 else "",
-                "ConsolidationSource": getattr(consolidation, 'source', 'manual')
-            }
+#             await people_collection.update_one(
+#                 {"_id": ObjectId(person_id)},
+#                 {"$set": update_data}
+#             )
+#         else:
+#             person_doc = {
+#                 "Name": consolidation.person_name.strip(),
+#                 "Surname": consolidation.person_surname.strip(),
+#                 "Email": person_email,
+#                 "Number": consolidation.person_phone or "",
+#                 "Gender": "",
+#                 "Address": "",
+#                 "Birthday": "",
+#                 "Stage": "Consolidate",
+#                 "DecisionType": consolidation.decision_type.value,
+#                 "DecisionDate": consolidation.decision_date,
+#                 "Date Created": datetime.utcnow().isoformat(),
+#                 "UpdatedAt": datetime.utcnow().isoformat(),
+#                 "InvitedBy": current_user.get("email", ""),
+#                 "Leader @1": consolidation.leaders[0] if len(consolidation.leaders) > 0 else "",
+#                 "Leader @12": consolidation.leaders[1] if len(consolidation.leaders) > 1 else "",
+#                 "Leader @144": consolidation.leaders[2] if len(consolidation.leaders) > 2 else "",
+#                 "Leader @1728": consolidation.leaders[3] if len(consolidation.leaders) > 3 else "",
+#                 "ConsolidationSource": getattr(consolidation, 'source', 'manual')
+#             }
            
-            decision_history = [{
-                "type": consolidation.decision_type.value,
-                "date": consolidation.decision_date,
-                "consolidation_id": consolidation_id,
-                "source": getattr(consolidation, 'source', 'manual')
-            }]
+#             decision_history = [{
+#                 "type": consolidation.decision_type.value,
+#                 "date": consolidation.decision_date,
+#                 "consolidation_id": consolidation_id,
+#                 "source": getattr(consolidation, 'source', 'manual')
+#             }]
            
-            person_doc["DecisionHistory"] = decision_history
-            person_doc["TotalRecommitments"] = 1 if consolidation.decision_type == DecisionType.RECOMMITMENT else 0
+#             person_doc["DecisionHistory"] = decision_history
+#             person_doc["TotalRecommitments"] = 1 if consolidation.decision_type == DecisionType.RECOMMITMENT else 0
            
-            if consolidation.decision_type == DecisionType.FIRST_TIME:
-                person_doc["FirstDecisionDate"] = consolidation.decision_date
-            else:
-                person_doc["LastDecisionDate"] = consolidation.decision_date
+#             if consolidation.decision_type == DecisionType.FIRST_TIME:
+#                 person_doc["FirstDecisionDate"] = consolidation.decision_date
+#             else:
+#                 person_doc["LastDecisionDate"] = consolidation.decision_date
            
-            result = await people_collection.insert_one(person_doc)
-            person_id = str(result.inserted_id)
-            print(f"Created new person: {person_id}")
+#             result = await people_collection.insert_one(person_doc)
+#             person_id = str(result.inserted_id)
+#             print(f"Created new person: {person_id}")
            
-            new_person_cache_entry = {
-                "_id": person_id,
-                "Name": consolidation.person_name.strip(),
-                "Surname": consolidation.person_surname.strip(),
-                "Email": person_email,
-                "Number": consolidation.person_phone or "",
-                "Gender": "",
-                "Leader @1": consolidation.leaders[0] if len(consolidation.leaders) > 0 else "",
-                "Leader @12": consolidation.leaders[1] if len(consolidation.leaders) > 1 else "",
-                "Leader @144": consolidation.leaders[2] if len(consolidation.leaders) > 2 else "",
-                "Leader @1728": consolidation.leaders[3] if len(consolidation.leaders) > 3 else "",
-                "FullName": f"{consolidation.person_name.strip()} {consolidation.person_surname.strip()}".strip(),
-                "ConsolidationSource": getattr(consolidation, 'source', 'manual')
-            }
-            people_cache["data"].append(new_person_cache_entry)
-            print(f"Added to cache: {new_person_cache_entry['FullName']}")
+#             new_person_cache_entry = {
+#                 "_id": person_id,
+#                 "Name": consolidation.person_name.strip(),
+#                 "Surname": consolidation.person_surname.strip(),
+#                 "Email": person_email,
+#                 "Number": consolidation.person_phone or "",
+#                 "Gender": "",
+#                 "Leader @1": consolidation.leaders[0] if len(consolidation.leaders) > 0 else "",
+#                 "Leader @12": consolidation.leaders[1] if len(consolidation.leaders) > 1 else "",
+#                 "Leader @144": consolidation.leaders[2] if len(consolidation.leaders) > 2 else "",
+#                 "Leader @1728": consolidation.leaders[3] if len(consolidation.leaders) > 3 else "",
+#                 "FullName": f"{consolidation.person_name.strip()} {consolidation.person_surname.strip()}".strip(),
+#                 "ConsolidationSource": getattr(consolidation, 'source', 'manual')
+#             }
+#             people_cache["data"].append(new_person_cache_entry)
+#             print(f"Added to cache: {new_person_cache_entry['FullName']}")
 
-        # 2. Resolve leader email
-        leader_email = consolidation.assigned_to_email
-        leader_user_id = None
+#         # 2. Resolve leader email
+#         leader_email = consolidation.assigned_to_email
+#         leader_user_id = None
        
-        if not leader_email:
-            print(f"Searching for leader email: {consolidation.assigned_to}")
+#         if not leader_email:
+#             print(f"Searching for leader email: {consolidation.assigned_to}")
             
-            leader_parts = consolidation.assigned_to.strip().split()
-            first_name = leader_parts[0] if leader_parts else ""
-            surname = " ".join(leader_parts[1:]) if len(leader_parts) > 1 else ""
+#             leader_parts = consolidation.assigned_to.strip().split()
+#             first_name = leader_parts[0] if leader_parts else ""
+#             surname = " ".join(leader_parts[1:]) if len(leader_parts) > 1 else ""
             
-            leader_person = await people_collection.find_one({
-                "$or": [
-                    {"$expr": {"$eq": [{"$concat": ["$Name", " ", "$Surname"]}, consolidation.assigned_to]}},
-                    {"Name": first_name, "Surname": surname},
-                    {"$expr": {"$eq": [
-                        {"$toLower": {"$concat": ["$Name", " ", "$Surname"]}},
-                        consolidation.assigned_to.lower()
-                    ]}}
-                ]
-            })
-            print(f"Leader lookup for '{consolidation.assigned_to}': found={leader_person is not None}, email={leader_email}")
-            if leader_person:
-                leader_email = leader_person.get("Email")
-                print(f"Found leader email from people: {leader_email}")
+#             leader_person = await people_collection.find_one({
+#                 "$or": [
+#                     {"$expr": {"$eq": [{"$concat": ["$Name", " ", "$Surname"]}, consolidation.assigned_to]}},
+#                     {"Name": first_name, "Surname": surname},
+#                     {"$expr": {"$eq": [
+#                         {"$toLower": {"$concat": ["$Name", " ", "$Surname"]}},
+#                         consolidation.assigned_to.lower()
+#                     ]}}
+#                 ]
+#             })
+#             print(f"Leader lookup for '{consolidation.assigned_to}': found={leader_person is not None}, email={leader_email}")
+#             if leader_person:
+#                 leader_email = leader_person.get("Email")
+#                 print(f"Found leader email from people: {leader_email}")
             
-            if not leader_email and first_name:
-                leader_user = await users_collection.find_one({
-                    "$or": [
-                        {"name": first_name, "surname": surname},
-                        {"$expr": {"$eq": [
-                            {"$toLower": {"$concat": ["$name", " ", "$surname"]}},
-                            consolidation.assigned_to.lower()
-                        ]}}
-                    ]
-                })
-                if leader_user:
-                    leader_email = leader_user.get("email")
-                    print(f"Found leader email from users: {leader_email}")
+#             if not leader_email and first_name:
+#                 leader_user = await users_collection.find_one({
+#                     "$or": [
+#                         {"name": first_name, "surname": surname},
+#                         {"$expr": {"$eq": [
+#                             {"$toLower": {"$concat": ["$name", " ", "$surname"]}},
+#                             consolidation.assigned_to.lower()
+#                         ]}}
+#                     ]
+#                 })
+#                 if leader_user:
+#                     leader_email = leader_user.get("email")
+#                     print(f"Found leader email from users: {leader_email}")
 
-        if leader_email:
-            # Plan Change / Normalization: Lowercase email to ensure accurate database lookup
-            leader_email = leader_email.strip().lower()
-            leader_user = await users_collection.find_one({"email": leader_email})
-            if leader_user:
-                leader_user_id = str(leader_user["_id"])
-                print(f"Leader user account: {leader_email} (ID: {leader_user_id})")
-            else:
-                print(f"Leader has email {leader_email} but no user account")
-        else:
-            print(f"Could not find email for leader: {consolidation.assigned_to}")
+#         if leader_email:
+#             # Plan Change / Normalization: Lowercase email to ensure accurate database lookup
+#             leader_email = leader_email.strip().lower()
+#             leader_user = await users_collection.find_one({"email": leader_email})
+#             if leader_user:
+#                 leader_user_id = str(leader_user["_id"])
+#                 print(f"Leader user account: {leader_email} (ID: {leader_user_id})")
+#             else:
+#                 print(f"Leader has email {leader_email} but no user account")
+#         else:
+#             print(f"Could not find email for leader: {consolidation.assigned_to}")
 
-        decision_display_name = "First Time Decision" if consolidation.decision_type == DecisionType.FIRST_TIME else "Recommitment"
-        consolidation_source = getattr(consolidation, 'source', 'manual')
+#         decision_display_name = "First Time Decision" if consolidation.decision_type == DecisionType.FIRST_TIME else "Recommitment"
+#         consolidation_source = getattr(consolidation, 'source', 'manual')
         
-        # XMind Requirement: Map source to display name
-        if consolidation_source == "service_consolidation":
-            source_display = "Service"
-        elif consolidation_source == "event_consolidation":
-            source_display = "Event"
-        elif consolidation_source == "cell_consolidation":
-            source_display = "Cell"
-        else:
-            source_display = "Manual"
+#         # XMind Requirement: Map source to display name
+#         if consolidation_source == "service_consolidation":
+#             source_display = "Service"
+#         elif consolidation_source == "event_consolidation":
+#             source_display = "Event"
+#         elif consolidation_source == "cell_consolidation":
+#             source_display = "Cell"
+#         else:
+#             source_display = "Manual"
             
-        assigned_for = leader_email if leader_email else consolidation.assigned_to
+#         assigned_for = leader_email if leader_email else consolidation.assigned_to
        
-        # 3. Create task
-        task_doc = {
-            "memberID": leader_user_id if leader_user_id else None,
-            "name": f"Consolidation: {consolidation.person_name} {consolidation.person_surname} ({decision_display_name})",
-            "taskType": "consolidation",
-            "description": f"Follow up with {consolidation.person_name} {consolidation.person_surname} who made a {decision_display_name.lower()} on {consolidation.decision_date} ({source_display} Consolidation)",
-            "followup_date": datetime.utcnow().isoformat(),
-            "status": "Open",
-            "assignedfor": assigned_for,
-            "assigned_to_email": leader_email,
-            "assigned_to_user_id": leader_user_id,
-            "leader_assigned": consolidation.assigned_to,
-            "leader_name": consolidation.assigned_to,
-            "type": "followup",
-            "priority": "high",
-            "consolidation_id": consolidation_id,
-            "person_id": person_id,
-            "person_name": consolidation.person_name,
-            "person_surname": consolidation.person_surname,
-            "decision_type": consolidation.decision_type.value,
-            "decision_display_name": decision_display_name,
-            "consolidation_source": consolidation_source,
-            "source_display": source_display,
-            "contacted_person": {
-                "name": f"{consolidation.person_name} {consolidation.person_surname}",
-                "email": person_email,
-                "phone": consolidation.person_phone or ""
-            },
-            "created_at": datetime.utcnow().isoformat(),
-            "created_by": current_user.get("email", ""),
-            "is_consolidation_task": True
-        }
+#         # 3. Create task
+#         task_doc = {
+#             "memberID": leader_user_id if leader_user_id else None,
+#             "name": f"Consolidation: {consolidation.person_name} {consolidation.person_surname} ({decision_display_name})",
+#             "taskType": "consolidation",
+#             "description": f"Follow up with {consolidation.person_name} {consolidation.person_surname} who made a {decision_display_name.lower()} on {consolidation.decision_date} ({source_display} Consolidation)",
+#             "followup_date": datetime.utcnow().isoformat(),
+#             "status": "Open",
+#             "assignedfor": assigned_for,
+#             "assigned_to_email": leader_email,
+#             "assigned_to_user_id": leader_user_id,
+#             "leader_assigned": consolidation.assigned_to,
+#             "leader_name": consolidation.assigned_to,
+#             "type": "followup",
+#             "priority": "high",
+#             "consolidation_id": consolidation_id,
+#             "person_id": person_id,
+#             "person_name": consolidation.person_name,
+#             "person_surname": consolidation.person_surname,
+#             "decision_type": consolidation.decision_type.value,
+#             "decision_display_name": decision_display_name,
+#             "consolidation_source": consolidation_source,
+#             "source_display": source_display,
+#             "contacted_person": {
+#                 "name": f"{consolidation.person_name} {consolidation.person_surname}",
+#                 "email": person_email,
+#                 "phone": consolidation.person_phone or ""
+#             },
+#             "created_at": datetime.utcnow().isoformat(),
+#             "created_by": current_user.get("email", ""),
+#             "is_consolidation_task": True
+#         }
 
-        task_result = await tasks_collection.insert_one(task_doc)
-        task_id = str(task_result.inserted_id)
+#         task_result = await tasks_collection.insert_one(task_doc)
+#         task_id = str(task_result.inserted_id)
 
-        # 4. Build consolidation record
-        consolidation_record = {
-            "id": consolidation_id,
-            "person_id": person_id,
-            "person_name": consolidation.person_name,
-            "person_surname": consolidation.person_surname,
-            "person_email": person_email,
-            "person_phone": consolidation.person_phone or "",
-            "decision_type": consolidation.decision_type.value,
-            "decision_display_name": decision_display_name,
-            "assigned_to": consolidation.assigned_to,
-            "assigned_to_email": leader_email,
-            "created_at": datetime.utcnow().isoformat(),
-            "type": "consolidation",
-            "status": "active",
-            "notes": consolidation.notes,
-            "source": consolidation_source,
-            "source_display": source_display,
-            "task_id": task_id,
-        }
+#         # 4. Build consolidation record
+#         consolidation_record = {
+#             "id": consolidation_id,
+#             "person_id": person_id,
+#             "person_name": consolidation.person_name,
+#             "person_surname": consolidation.person_surname,
+#             "person_email": person_email,
+#             "person_phone": consolidation.person_phone or "",
+#             "decision_type": consolidation.decision_type.value,
+#             "decision_display_name": decision_display_name,
+#             "assigned_to": consolidation.assigned_to,
+#             "assigned_to_email": leader_email,
+#             "created_at": datetime.utcnow().isoformat(),
+#             "type": "consolidation",
+#             "status": "active",
+#             "notes": consolidation.notes,
+#             "source": consolidation_source,
+#             "source_display": source_display,
+#             "task_id": task_id,
+#         }
 
-        # 5. Add to event — strip date suffix before ObjectId lookup
-        if consolidation.event_id:
-            parts = consolidation.event_id.split("_")
-            base_event_id = parts[0]
-            instance_date = parts[1] if len(parts) > 1 else None
+#         # 5. Add to event — strip date suffix before ObjectId lookup
+#         if consolidation.event_id:
+#             parts = consolidation.event_id.split("_")
+#             base_event_id = parts[0]
+#             instance_date = parts[1] if len(parts) > 1 else None
 
-            if ObjectId.is_valid(base_event_id):
-                event_for_cons = await events_collection.find_one({"_id": ObjectId(base_event_id)})
-                is_recurring_event = bool(event_for_cons.get("recurring_day")) if event_for_cons else False
+#             if ObjectId.is_valid(base_event_id):
+#                 event_for_cons = await events_collection.find_one({"_id": ObjectId(base_event_id)})
+#                 is_recurring_event = bool(event_for_cons.get("recurring_day")) if event_for_cons else False
 
-                if is_recurring_event:
-                    if not instance_date:
-                        timezone = pytz.timezone("Africa/Johannesburg")
-                        instance_date = datetime.now(timezone).date().isoformat()
+#                 if is_recurring_event:
+#                     if not instance_date:
+#                         timezone = pytz.timezone("Africa/Johannesburg")
+#                         instance_date = datetime.now(timezone).date().isoformat()
 
-                    await events_collection.update_one(
-                        {"_id": ObjectId(base_event_id)},
-                        {
-                            "$push": {f"attendance.{instance_date}.consolidations": consolidation_record},
-                            "$set": {"updated_at": datetime.utcnow().isoformat()}
-                        }
-                    )
-                    print(f"Added consolidation to recurring event attendance[{instance_date}]")
-                else:
-                    await events_collection.update_one(
-                        {"_id": ObjectId(base_event_id)},
-                        {
-                            "$push": {"consolidations": consolidation_record},
-                            "$set": {"updated_at": datetime.utcnow().isoformat()}
-                        }
-                    )
-                    print(f"Added consolidation to non-recurring event root")
+#                     await events_collection.update_one(
+#                         {"_id": ObjectId(base_event_id)},
+#                         {
+#                             "$push": {f"attendance.{instance_date}.consolidations": consolidation_record},
+#                             "$set": {"updated_at": datetime.utcnow().isoformat()}
+#                         }
+#                     )
+#                     print(f"Added consolidation to recurring event attendance[{instance_date}]")
+#                 else:
+#                     await events_collection.update_one(
+#                         {"_id": ObjectId(base_event_id)},
+#                         {
+#                             "$push": {"consolidations": consolidation_record},
+#                             "$set": {"updated_at": datetime.utcnow().isoformat()}
+#                         }
+#                     )
+#                     print(f"Added consolidation to non-recurring event root")
 
-                # Verify write
-                verification = await events_collection.find_one({"_id": ObjectId(base_event_id)})
-                if is_recurring_event:
-                    att = verification.get("attendance", {}).get(instance_date, {})
-                    print(f"VERIFY: attendance[{instance_date}].consolidations = {len(att.get('consolidations', []))}")
-                else:
-                    print(f"VERIFY: root consolidations = {len(verification.get('consolidations', []))}")
-            else:
-                print(f"Invalid base event ID: {base_event_id}")
+#                 # Verify write
+#                 verification = await events_collection.find_one({"_id": ObjectId(base_event_id)})
+#                 if is_recurring_event:
+#                     att = verification.get("attendance", {}).get(instance_date, {})
+#                     print(f"VERIFY: attendance[{instance_date}].consolidations = {len(att.get('consolidations', []))}")
+#                 else:
+#                     print(f"VERIFY: root consolidations = {len(verification.get('consolidations', []))}")
+#             else:
+#                 print(f"Invalid base event ID: {base_event_id}")
 
-        # 6. Save to consolidations collection
-        consolidation_doc = {
-            "_id": ObjectId(consolidation_id),
-            "person_id": person_id,
-            "person_name": consolidation.person_name,
-            "person_surname": consolidation.person_surname,
-            "person_email": person_email,
-            "person_phone": consolidation.person_phone,
-            "decision_type": consolidation.decision_type.value,
-            "decision_display_name": decision_display_name,
-            "decision_date": consolidation.decision_date,
-            "assigned_to": consolidation.assigned_to,
-            "assigned_to_email": leader_email,
-            "assigned_to_user_id": leader_user_id,
-            "event_id": consolidation.event_id,
-            "notes": consolidation.notes,
-            "created_by": current_user.get("email", ""),
-            "created_at": datetime.utcnow().isoformat(),
-            "status": "active",
-            "task_id": task_id,
-            "source": consolidation_source,
-            "source_display": source_display
-        }
+#         # 6. Save to consolidations collection
+#         consolidation_doc = {
+#             "_id": ObjectId(consolidation_id),
+#             "person_id": person_id,
+#             "person_name": consolidation.person_name,
+#             "person_surname": consolidation.person_surname,
+#             "person_email": person_email,
+#             "person_phone": consolidation.person_phone,
+#             "decision_type": consolidation.decision_type.value,
+#             "decision_display_name": decision_display_name,
+#             "decision_date": consolidation.decision_date,
+#             "assigned_to": consolidation.assigned_to,
+#             "assigned_to_email": leader_email,
+#             "assigned_to_user_id": leader_user_id,
+#             "event_id": consolidation.event_id,
+#             "notes": consolidation.notes,
+#             "created_by": current_user.get("email", ""),
+#             "created_at": datetime.utcnow().isoformat(),
+#             "status": "active",
+#             "task_id": task_id,
+#             "source": consolidation_source,
+#             "source_display": source_display
+#         }
 
-        consolidations_collection = db["consolidations"]
-        await consolidations_collection.insert_one(consolidation_doc)
-        print(f"Created consolidation record: {consolidation_id}")
+#         consolidations_collection = db["consolidations"]
+#         await consolidations_collection.insert_one(consolidation_doc)
+#         print(f"Created consolidation record: {consolidation_id}")
 
-        total_people_count = await people_collection.count_documents({})
+#         total_people_count = await people_collection.count_documents({})
 
-        return {
-            "message": f"{decision_display_name} recorded successfully and assigned to {consolidation.assigned_to}",
-            "consolidation_id": consolidation_id,
-            "person_id": person_id,
-            "task_id": task_id,
-            "decision_type": consolidation.decision_type.value,
-            "assigned_to": consolidation.assigned_to,
-            "assigned_to_email": leader_email,
-            "leader_user_id": leader_user_id,
-            "people_count_updated": total_people_count,
-            "success": True
-        }
+#         return {
+#             "message": f"{decision_display_name} recorded successfully and assigned to {consolidation.assigned_to}",
+#             "consolidation_id": consolidation_id,
+#             "person_id": person_id,
+#             "task_id": task_id,
+#             "decision_type": consolidation.decision_type.value,
+#             "assigned_to": consolidation.assigned_to,
+#             "assigned_to_email": leader_email,
+#             "leader_user_id": leader_user_id,
+#             "people_count_updated": total_people_count,
+#             "success": True
+#         }
 
-    except Exception as e:
-        print(f"Error creating consolidation: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error creating consolidation: {str(e)}")
+#     except Exception as e:
+#         print(f"Error creating consolidation: {str(e)}")
+#         import traceback
+#         traceback.print_exc()
+#         raise HTTPException(status_code=500, detail=f"Error creating consolidation: {str(e)}")
     
 @app.get("/api/users")
 async def get_all_users():
