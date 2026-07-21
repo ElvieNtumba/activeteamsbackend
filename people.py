@@ -1,9 +1,10 @@
 from datetime import datetime
 from typing import Optional
+from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Query, Path, Body, Depends
 from auth.models import PersonCreate
 from auth.utils import get_current_user
-from database import db, people_collection, ObjectId
+from database import db, people_collection
 
 router = APIRouter()
 

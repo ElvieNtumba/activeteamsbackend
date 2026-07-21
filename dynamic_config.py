@@ -1,22 +1,28 @@
-import os
+import asyncio
+from motor.motor_asyncio import AsyncIOMotorClient
 from datetime import datetime
+import os
 from dotenv import load_dotenv
-from Backend.activeteamsbackend.supabase_helpers.supabase_connection import supabase
 
 load_dotenv()
 
-DB_NAME = os.getenv("DB_NAME", "active-teams-db")
+MONGO_URI = "mongodb+srv://activeteams:helloactiveteams@active-teams.ykghvqr.mongodb.net/"
+DB_NAME = "test-data-active-teams"
+
+client = AsyncIOMotorClient(MONGO_URI)
+db = client[DB_NAME]
+org_config_collection = db["OrgConfig"]
 
 async def seed():
-    print(f"Using Supabase project for DB_NAME: {DB_NAME}")
-    print("Seeding OrgConfig...")
-    result = supabase.table("OrgConfig").select("id").eq("id", "active-teams").execute()
-    existing = result.data[0] if getattr(result, "data", None) else None
+    print(f"Connecting to database: {DB_NAME}")
+    print(f"Collection: OrgConfig")
+    print("-" * 40)
+    existing = await org_config_collection.find_one({"_id": "active-teams"})
     if existing:
         print("Config for 'active-teams' already exists, skipping.")
         return
     config = {
-        "id": "active-teams",
+        "_id": "active-teams",
         "org_name": "Active Teams",
         "events_collection": "Events",
         "people_collection": "People",
@@ -29,22 +35,41 @@ async def seed():
         "top_leaders": {"male": "Gavin Enslin", "female": "Vicky Enslin"},
         "allows_create_event": True,
         "allows_create_event_type": True,
-        "created_at": datetime.utcnow().isoformat(),
-        "updated_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
         "created_by": "seed_script",
         "is_default": True
     }
-    supabase.table("OrgConfig").insert(config).execute()
+    await org_config_collection.insert_one(config)
     print("Successfully seeded 'active-teams' config!")
+
+async def tag_events():
+    print("Tagging existing events with org_id...")
+    result = await db["AllEvents"].update_many(
+        {"org_id": {"$exists": False}},
+        {"$set": {"org_id": "active-teams"}}
+    )
+    print(f"Tagged {result.modified_count} events with org_id: active-teams")
+
+async def tag_event_types():
+    print("Tagging existing event types with org_id...")
+    result = await db["AllEvents"].update_many(
+        {"isEventType": True, "org_id": {"$exists": False}},
+        {"$set": {"org_id": "active-teams"}}
+    )
+    print(f"Tagged {result.modified_count} event types with org_id: active-teams")
 
 async def main():
     try:
         await seed()
+        await tag_events()
+        await tag_event_types() 
     except Exception as e:
         print(f"Error: {e}")
         import traceback
         traceback.print_exc()
-
+    finally:
+        client.close()
+        print("Connection closed.")
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
