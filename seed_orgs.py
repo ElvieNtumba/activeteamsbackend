@@ -1,13 +1,22 @@
+import asyncio
+from motor.motor_asyncio import AsyncIOMotorClient
 import os
 from dotenv import load_dotenv
-from Backend.activeteamsbackend.supabase_helpers.supabase_connection import supabase
 
 load_dotenv()
+
+MONGO_URI = "mongodb+srv://activeteams:helloactiveteams@active-teams.ykghvqr.mongodb.net/"
+# Make sure to set DB_NAME in your .env or it will default to active-teams-db
 DB_NAME = os.getenv("DB_NAME", "active-teams-db")
 
 async def seed_organizations():
-    print(f"Using Supabase DB: {DB_NAME}")
-
+    print(f"Connecting to MongoDB at {MONGO_URI}")
+    print(f"Target Database: {DB_NAME}")
+    
+    client = AsyncIOMotorClient(MONGO_URI)
+    db = client[DB_NAME]
+    org_collection = db["organizations"]
+    
     test_orgs = [
         {"name": "Active Church", "tag": "Active Church"},
         {"name": "City Church", "tag": "City Church"},
@@ -15,18 +24,20 @@ async def seed_organizations():
         {"name": "Victory Outreach", "tag": "Victory Outreach"},
         {"name": "New Life Fellowship", "tag": "New Life Fellowship"}
     ]
-
-    existing_result = supabase.table("organizations").select("name").execute()
-    existing_names = {row["name"] for row in (existing_result.data or [])}
-
+    
+    print(f"Seeding {len(test_orgs)} organizations into '{DB_NAME}.organizations'...")
+    
     for org in test_orgs:
-        if org["name"] in existing_names:
+        # Avoid duplicates by checking name
+        existing = await org_collection.find_one({"name": org["name"]})
+        if not existing:
+            await org_collection.insert_one(org)
+            print(f"  [+] Added: {org['name']}")
+        else:
             print(f"  [.] Already exists: {org['name']}")
-            continue
-        supabase.table("organizations").insert(org).execute()
-        print(f"  [+] Added: {org['name']}")
+    
     print("Seeding complete!")
+    client.close()
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(seed_organizations())
