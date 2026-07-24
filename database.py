@@ -645,7 +645,7 @@ load_dotenv()
 
 
 MONGO_URI = os.getenv("MONGO_URI","None")
-DB_NAME = "test-data-active-teams"
+DB_NAME = "active-teams-db"
 # os.getenv("DB_NAME", "active-teams-db")
 
 print(f"--- CONNECTING TO DB: {DB_NAME} ---")

@@ -30,6 +30,10 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from time import sleep
 from supreme_admin import router as supreme_admin_router
 from events import router as events_router
+from admin import router as admin_router
+from admin import event_type_router as admin_event_type_router
+from admin import task_type_router as admin_task_type_router
+from admin import auto_reactivate_expired_events as admin_auto_reactivate_expired_events
 
 
 #add routers here:
@@ -62,6 +66,9 @@ app.add_middleware(
 )
 
 app.include_router(supreme_admin_router)
+app.include_router(admin_router)
+app.include_router(admin_event_type_router)
+app.include_router(admin_task_type_router)
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -3674,6 +3681,11 @@ def convert_event_for_display(event):
 # scheduler.add_job(auto_reactivate_expired_events,'cron',hour=0,minute=0) 
 # scheduler.start()
 # sleep(10)
+
+scheduler = AsyncIOScheduler()
+scheduler.add_job(admin_auto_reactivate_expired_events, 'cron', hour=0, minute=0)
+scheduler.start()
+sleep(10)
   
 #------------------ MIGRATION ENDPOINTS ---------- 
 @app.post("/migrate-event-types-uuids")
@@ -10443,7 +10455,7 @@ async def create_user(
     except Exception as e:
         print(f"Error creating user: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error creating user: {str(e)}")
-SUPREME_ADMIN_EMAIL = "tkgenia1234@gmail.com"
+SUPREME_ADMIN_EMAIL = "plaatjiessamuel98@gmail.com"
 
 ROLE_HIERARCHY = {
     "registrant":2,

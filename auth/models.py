@@ -307,6 +307,7 @@ class TaskTypeIn(BaseModel):
 class TaskTypeOut(BaseModel):
     id: str
     name: str
+    organization: str
 
 class PersonInfo(BaseModel):
     name: Optional[str]
@@ -482,5 +483,3 @@ class SupremeAdminResponse(BaseModel):
 class SupremeAdminList(BaseModel):
     admins: List[SupremeAdminResponse]
     total: int
-
-
