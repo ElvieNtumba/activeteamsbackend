@@ -434,12 +434,10 @@ def _add_leader_chart(ws, leader_name, week_cols, anchor_row,
     # Same reasoning as the OVERALL chart: no numeric chart.style — we set
     # line/marker appearance explicitly per-series instead.
 
-    # CRITICAL: Excel/Sheets exclude hidden rows/columns from charts by
-    # default (plotVisOnly=True). Since the leader-block table rows behind
-    # this chart are hidden (chart-only sheet), we must disable that so the
-    # chart still plots the data — otherwise it renders as an empty
-    # "Add a series to start visualising your data" placeholder.
-    chart.plotVisOnly = False
+    # NOTE: rows are no longer marked `hidden` (see _hide_table_rows) — they're
+    # shrunk to 1pt height instead, because Google Sheets' .xlsx importer drops
+    # chart series whose source cells sit in a hidden row regardless of
+    # plotVisOnly. Leaving plotVisOnly at its default (True) is fine now.
 
     att_ref = Reference(ws, min_col=min_col, max_col=max_col, min_row=totals_row, max_row=totals_row)
     chart.add_data(att_ref, titles_from_data=False, from_rows=True)
@@ -468,10 +466,22 @@ def _add_leader_chart(ws, leader_name, week_cols, anchor_row,
 
 
 def _hide_table_rows(ws, first_row: int, last_row: int) -> None:
-    """Hide the underlying data rows (still present for chart references,
-    but not visible) so an individual leader sheet shows chart-only."""
+    """
+    Collapse the underlying data rows so an individual leader sheet reads as
+    chart-only, WITHOUT using the `hidden` row flag.
+
+    Why not `hidden`: openpyxl's `chart.plotVisOnly = False` is an Excel-only
+    escape hatch that tells Excel "plot this series even though its source
+    row is hidden." Google Sheets' .xlsx importer does not honor
+    `plotVisOnly` at all — when a chart's series reference sits inside a row
+    marked hidden, Sheets drops the series entirely, which is exactly the
+    "Add a series to start visualising your data" empty-chart bug. Since
+    these workbooks are opened in Google Sheets, we instead shrink the rows
+    to near-zero height (still technically visible, so Sheets keeps the
+    chart data) rather than hiding them outright.
+    """
     for r in range(first_row, last_row + 1):
-        ws.row_dimensions[r].hidden = True
+        ws.row_dimensions[r].height = 1
     ws.sheet_view.showGridLines = False
     ws.freeze_panes = None
 
