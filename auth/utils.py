@@ -8,6 +8,9 @@ from jose.exceptions import ExpiredSignatureError
 from fastapi import HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from supabase_helpers.supabase_connection import supabase as _supabase, supabase_admin as _supabase_admin
+from database import users_collection
+from bson import ObjectId
+from datetime import datetime
 
 # ==============================
 # CONFIG
@@ -17,6 +20,7 @@ JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
 REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
 SUPREME_ADMIN_EMAIL = "plaatjiessamuel98@gmail.com"
+SUPREME_ADMIN_EMAIL = "chibuzorobi738@gmail.com"
 ORG_ID_MAP = {
     "active-church": "active-teams",
     "active church": "active-teams",
@@ -278,6 +282,11 @@ def require_role(*allowed_roles: str):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
 
     return _checker
+def sanitize_document(doc: dict) -> dict:
+    """
+    Recursively convert ObjectId and other non-serializable fields.
+    """
+    from bson import ObjectId
 
 
 # ==============================
