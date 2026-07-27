@@ -1,7 +1,7 @@
 import os
 from datetime import datetime
 from dotenv import load_dotenv
-from supabase_helpers.supabase_client import supabase
+from Backend.activeteamsbackend.supabase_helpers.supabase_connection import supabase
 
 load_dotenv()
 

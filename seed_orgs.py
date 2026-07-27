@@ -1,6 +1,6 @@
 import os
 from dotenv import load_dotenv
-from supabase_helpers.supabase_client import supabase
+from Backend.activeteamsbackend.supabase_helpers.supabase_connection import supabase
 
 load_dotenv()
 DB_NAME = os.getenv("DB_NAME", "active-teams-db")
