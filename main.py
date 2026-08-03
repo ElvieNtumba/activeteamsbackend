@@ -139,6 +139,138 @@ DB_NAME = os.getenv("DB_NAME", "active-teams-db")
 consolidations_collection = db.get_collection("consolidations")
 
 
+def _normalize_text(value) -> str:
+    return (value or "").strip()
+
+
+def _role_is_leader_eligible(role_value) -> bool:
+    if not role_value:
+        return False
+    role_text = str(role_value).strip().lower()
+    if role_text in {"admin", "leader", "leaderat12", "leaderat144", "leaderat1728", "manager", "org_admin", "super_admin"}:
+        return True
+    return "leader" in role_text or "admin" in role_text
+
+
+async def _find_user_by_name_or_email(candidate_name: str, candidate_email: str = ""):
+    candidate_name = _normalize_text(candidate_name)
+    candidate_email = _normalize_text(candidate_email)
+    if not candidate_name and not candidate_email:
+        return None
+
+    query_parts = []
+    if candidate_email:
+        query_parts.append({"email": {"$regex": f"^{re.escape(candidate_email)}$", "$options": "i"}})
+    if candidate_name:
+        parts = [p for p in candidate_name.split(" ") if p]
+        first_name = parts[0] if parts else ""
+        last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
+        if first_name:
+            query_parts.append({"name": {"$regex": f"^{re.escape(first_name)}$", "$options": "i"}})
+        if last_name:
+            query_parts.append({"surname": {"$regex": f"^{re.escape(last_name)}$", "$options": "i"}})
+        if first_name and last_name:
+            query_parts.append({"$expr": {"$eq": [{"$concat": ["$name", " ", "$surname"]}, candidate_name]}})
+
+    if not query_parts:
+        return None
+    return await users_collection.find_one({"$or": query_parts})
+
+
+async def _find_person_by_name_or_email(candidate_name: str, candidate_email: str = ""):
+    candidate_name = _normalize_text(candidate_name)
+    candidate_email = _normalize_text(candidate_email)
+    if not candidate_name and not candidate_email:
+        return None
+
+    query_parts = []
+    if candidate_email:
+        query_parts.append({"Email": {"$regex": f"^{re.escape(candidate_email)}$", "$options": "i"}})
+        query_parts.append({"email": {"$regex": f"^{re.escape(candidate_email)}$", "$options": "i"}})
+    if candidate_name:
+        parts = [p for p in candidate_name.split(" ") if p]
+        first_name = parts[0] if parts else ""
+        last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
+        if first_name:
+            query_parts.append({"Name": {"$regex": f"^{re.escape(first_name)}$", "$options": "i"}})
+        if last_name:
+            query_parts.append({"Surname": {"$regex": f"^{re.escape(last_name)}$", "$options": "i"}})
+        if first_name and last_name:
+            query_parts.append({"$expr": {"$eq": [{"$concat": ["$Name", " ", "$Surname"]}, candidate_name]}})
+
+    if not query_parts:
+        return None
+    return await people_collection.find_one({"$or": query_parts})
+
+
+async def resolve_consolidation_assignee(existing_person: dict | None, consolidation, current_user: dict) -> dict | None:
+    """Resolve the nearest valid leader in the hierarchy for a consolidation task."""
+    chain_candidates = []
+    seen = set()
+
+    def _append_candidate(value: str, source: str):
+        cleaned = _normalize_text(value)
+        if not cleaned:
+            return
+        key = cleaned.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        chain_candidates.append((cleaned, source))
+
+    initial_name = _normalize_text(getattr(consolidation, "assigned_to", ""))
+    initial_email = _normalize_text(getattr(consolidation, "assigned_to_email", ""))
+    if initial_name:
+        _append_candidate(initial_name, "direct-assigned")
+    if initial_email:
+        _append_candidate(initial_email, "direct-email")
+
+    leaders_payload = getattr(consolidation, "leaders", []) or []
+    if isinstance(leaders_payload, list):
+        for leader_name in leaders_payload:
+            _append_candidate(leader_name, "leaders-list")
+
+    if existing_person:
+        for key in ["Leader @1", "Leader @12", "Leader @144", "Leader @1728", "leader1", "leader12", "leader144", "leader1728"]:
+            _append_candidate(existing_person.get(key, ""), "existing-person-leader")
+        invited_by = existing_person.get("InvitedBy") or existing_person.get("invited_by") or existing_person.get("Invited By")
+        if invited_by:
+            _append_candidate(invited_by, "existing-person-invited-by")
+
+    for candidate_name, source in chain_candidates:
+        candidate_user = await _find_user_by_name_or_email(candidate_name, candidate_name if "@" in candidate_name else "")
+        if not candidate_user and "@" in candidate_name:
+            candidate_user = await _find_user_by_name_or_email("", candidate_name)
+
+        if candidate_user and _role_is_leader_eligible(candidate_user.get("role")):
+            full_name = f"{candidate_user.get('name', '')} {candidate_user.get('surname', '')}".strip()
+            return {
+                "display_name": full_name or candidate_name,
+                "email": _normalize_text(candidate_user.get("email", "")),
+                "user_id": str(candidate_user.get("_id")) if candidate_user.get("_id") else None,
+                "reason": "direct-valid-leader" if source == "direct-assigned" else "hierarchy-valid-leader",
+            }
+
+        candidate_person = await _find_person_by_name_or_email(candidate_name, candidate_name if "@" in candidate_name else "")
+        if not candidate_person and "@" in candidate_name:
+            candidate_person = await _find_person_by_name_or_email("", candidate_name)
+
+        if candidate_person:
+            candidate_email = _normalize_text(candidate_person.get("Email") or candidate_person.get("email"))
+            if candidate_email:
+                mapped_user = await users_collection.find_one({"email": candidate_email.lower()})
+                if mapped_user and _role_is_leader_eligible(mapped_user.get("role")):
+                    full_name = f"{candidate_person.get('Name', '')} {candidate_person.get('Surname', '')}".strip()
+                    return {
+                        "display_name": full_name or candidate_name,
+                        "email": candidate_email,
+                        "user_id": str(mapped_user.get("_id")) if mapped_user.get("_id") else None,
+                        "reason": "direct-valid-leader" if source == "direct-assigned" else "hierarchy-valid-leader",
+                    }
+
+    return None
+
+
 def get_database_client():
     """Return a Mongo client instance compatible with existing `db` usage."""
     try:
@@ -11392,6 +11524,126 @@ async def get_event_summary_stats(event_id: str):
         print(f"Error calculating event stats: {e}")
         return {}
 
+async def _resolve_leader_field(person_context: dict | None, field_names: list[str]) -> dict | None:
+    """
+    Try to resolve a specific leader field (e.g. Leader @12) to a valid
+    leader-eligible User account. Returns None if the field is empty or
+    doesn't map to a leader-eligible account.
+    """
+    if not person_context:
+        return None
+
+    leader_name = ""
+    for field in field_names:
+        leader_name = _normalize_text(person_context.get(field, ""))
+        if leader_name:
+            break
+
+    if not leader_name:
+        return None
+
+    # Try matching a User account directly
+    candidate_user = await _find_user_by_name_or_email(leader_name)
+    if candidate_user and _role_is_leader_eligible(candidate_user.get("role")):
+        full_name = f"{candidate_user.get('name', '')} {candidate_user.get('surname', '')}".strip()
+        return {
+            "display_name": full_name or leader_name,
+            "email": _normalize_text(candidate_user.get("email", "")),
+            "user_id": str(candidate_user.get("_id")) if candidate_user.get("_id") else None,
+        }
+
+    # Fall back to People record → cross-reference Users by email
+    candidate_person = await _find_person_by_name_or_email(leader_name)
+    if candidate_person:
+        candidate_email = _normalize_text(candidate_person.get("Email") or candidate_person.get("email"))
+        if candidate_email:
+            mapped_user = await users_collection.find_one({"email": candidate_email.lower()})
+            if mapped_user and _role_is_leader_eligible(mapped_user.get("role")):
+                full_name = f"{candidate_person.get('Name', '')} {candidate_person.get('Surname', '')}".strip()
+                return {
+                    "display_name": full_name or leader_name,
+                    "email": candidate_email,
+                    "user_id": str(mapped_user.get("_id")) if mapped_user.get("_id") else None,
+                }
+
+    return None
+
+
+async def resolve_leader_from_path(person_context: dict | None, level_index: int) -> dict | None:
+    """
+    Resolve a specific ancestor in a person's LeaderPath by index.
+    LeaderPath is root-first: index 0 = Leader @1, index 1 = Leader @12, index 2 = Leader @144, ...
+    """
+    if not person_context:
+        return None
+
+    leader_path = person_context.get("LeaderPath", []) or []
+    if len(leader_path) <= level_index:
+        return None
+
+    leader_id = leader_path[level_index]
+    if not leader_id:
+        return None
+
+    try:
+        leader_id_obj = leader_id if isinstance(leader_id, ObjectId) else ObjectId(str(leader_id))
+    except Exception:
+        return None
+
+    leader_person = await people_collection.find_one(
+        {"_id": leader_id_obj},
+        {"_id": 1, "Name": 1, "Surname": 1, "Email": 1}
+    )
+    if not leader_person:
+        return None
+
+    leader_name = f"{leader_person.get('Name', '')} {leader_person.get('Surname', '')}".strip()
+    leader_email = _normalize_text(leader_person.get("Email", "")).lower()
+    if not leader_email:
+        return None
+
+    mapped_user = await users_collection.find_one({"email": leader_email})
+    user_id = str(mapped_user.get("_id")) if mapped_user else None
+
+    return {
+        "display_name": leader_name,
+        "email": leader_email,
+        "user_id": user_id,
+    }
+
+
+async def resolve_leader_at_12_with_fallback(person_context: dict | None, consolidation, current_user: dict) -> dict | None:
+    """
+    Assignment policy: always assign to Leader @12 (LeaderPath index 1).
+    Fall back to Leader @1 (LeaderPath index 0) if Leader @12 is missing.
+    Falls back further to legacy flat string fields for older records.
+    """
+    # 1. Leader @12 via LeaderPath
+    resolved = await resolve_leader_from_path(person_context, 1)
+    if resolved:
+        resolved["reason"] = "leader_at_12"
+        return resolved
+
+    # 2. Leader @1 via LeaderPath
+    resolved = await resolve_leader_from_path(person_context, 0)
+    if resolved:
+        resolved["reason"] = "fallback_leader_at_1"
+        return resolved
+
+    # 3. Legacy flat-field fallback (older records without LeaderPath)
+    resolved = await _resolve_leader_field(person_context, ["Leader @12", "leader12", "Leader at 12"])
+    if resolved:
+        resolved["reason"] = "leader_at_12_legacy"
+        return resolved
+
+    resolved = await _resolve_leader_field(person_context, ["Leader @1", "leader1", "Leader at 1"])
+    if resolved:
+        resolved["reason"] = "fallback_leader_at_1_legacy"
+        return resolved
+
+    return None
+
+
 @app.post("/consolidations")
 async def create_consolidation(
     consolidation: ConsolidationCreate,
@@ -11399,25 +11651,58 @@ async def create_consolidation(
 ):
     try:
         consolidation_id = str(ObjectId())
+        person_email = _normalize_text(consolidation.person_email)
+        if not person_email:
+            person_email = f"{_normalize_text(consolidation.person_name).lower()}.{_normalize_text(consolidation.person_surname).lower()}@consolidation.temp"
+
+        dedup_key = "|".join([
+            _normalize_text(person_email).lower(),
+            _normalize_text(consolidation.person_name).lower(),
+            _normalize_text(consolidation.person_surname).lower(),
+            _normalize_text(consolidation.decision_type.value if hasattr(consolidation.decision_type, "value") else str(consolidation.decision_type)).lower(),
+            _normalize_text(consolidation.decision_date).lower(),
+            _normalize_text(getattr(consolidation, "source", "manual")).lower(),
+            _normalize_text(getattr(consolidation, "event_id", "")).lower(),
+        ])
+
+        existing_task = await tasks_collection.find_one({"dedup_key": dedup_key})
+        if existing_task:
+            return {
+                "message": "Consolidation task already exists",
+                "consolidation_id": str(existing_task.get("consolidation_id") or existing_task.get("_id")),
+                "task_id": str(existing_task.get("_id")),
+                "success": True,
+                "duplicate": True,
+            }
+
+        existing_consolidation = await consolidations_collection.find_one({"dedup_key": dedup_key})
+        if existing_consolidation:
+            return {
+                "message": "Consolidation already exists",
+                "consolidation_id": str(existing_consolidation.get("_id")),
+                "task_id": str(existing_consolidation.get("task_id") or ""),
+                "success": True,
+                "duplicate": True,
+            }
        
         print(f"Creating consolidation for: {consolidation.person_name} {consolidation.person_surname}")
         print(f"Assigned to leader: {consolidation.assigned_to} (email: {consolidation.assigned_to_email})")
         print(f"Source: {getattr(consolidation, 'source', 'manual')}")
        
         # 1. Create or find the person
-        person_email = consolidation.person_email
-        if not person_email:
-            person_email = f"{consolidation.person_name.lower()}.{consolidation.person_surname.lower()}@consolidation.temp"
-       
         existing_person = await people_collection.find_one({
             "$or": [
                 {"Email": person_email},
-                {"Name": consolidation.person_name, "Surname": consolidation.person_surname}
+                {"Name": consolidation.person_name, "Surname": consolidation.person_surname},
+                {"Number": consolidation.person_phone or ""},
             ]
         })
        
         person_id = None
+        person_lookup_status = "existing_person_found"
+        person_context_for_resolver = None
         if existing_person:
+            person_context_for_resolver = existing_person
             person_id = str(existing_person["_id"])
             print(f"Found existing person: {person_id}")
             update_data = {
@@ -11496,6 +11781,8 @@ async def create_consolidation(
 
             created_doc = await people_collection.find_one({"_id": result.inserted_id})
             created_doc = created_doc or person_doc
+            person_context_for_resolver = created_doc
+            person_lookup_status = "new_person_created"
 
             new_person_cache_entry = {
                 "_id": person_id,
@@ -11506,53 +11793,21 @@ async def create_consolidation(
                 "Gender": created_doc.get("Gender", ""),
                 "Leader @1": created_doc.get("Leader @1", ""),
                 "Leader @12": created_doc.get("Leader @12", ""),
-                "Leader @144": created_doc.get("Leader @144", ""),
-                "Leader @1728": created_doc.get("Leader @1728", ""),
                 "FullName": f"{created_doc.get('Name', '')} {created_doc.get('Surname', '')}".strip(),
                 "ConsolidationSource": getattr(consolidation, 'source', 'manual')
             }
             people_cache["data"].append(new_person_cache_entry)
             print(f"Added to cache: {new_person_cache_entry['FullName']}")
 
-        # 2. Resolve leader email
-        leader_email = consolidation.assigned_to_email
-        leader_user_id = None
+        # 2. Resolve leader — always Leader @12, fall back to Leader @1
+        resolved_assignee = await resolve_leader_at_12_with_fallback(person_context_for_resolver, consolidation, current_user)
+        leader_email = resolved_assignee.get("email") if resolved_assignee else None
+        leader_user_id = resolved_assignee.get("user_id") if resolved_assignee else None
+        assignment_reason = resolved_assignee.get("reason") if resolved_assignee else "no_valid_leader_found"
+        assigned_for = (resolved_assignee.get("display_name") if resolved_assignee else None) or _normalize_text(consolidation.assigned_to)
        
         if not leader_email:
-            print(f"Searching for leader email: {consolidation.assigned_to}")
-            
-            leader_parts = consolidation.assigned_to.strip().split()
-            first_name = leader_parts[0] if leader_parts else ""
-            surname = " ".join(leader_parts[1:]) if len(leader_parts) > 1 else ""
-            
-            leader_person = await people_collection.find_one({
-                "$or": [
-                    {"$expr": {"$eq": [{"$concat": ["$Name", " ", "$Surname"]}, consolidation.assigned_to]}},
-                    {"Name": first_name, "Surname": surname},
-                    {"$expr": {"$eq": [
-                        {"$toLower": {"$concat": ["$Name", " ", "$Surname"]}},
-                        consolidation.assigned_to.lower()
-                    ]}}
-                ]
-            })
-            print(f"Leader lookup for '{consolidation.assigned_to}': found={leader_person is not None}, email={leader_email}")
-            if leader_person:
-                leader_email = leader_person.get("Email")
-                print(f"Found leader email from people: {leader_email}")
-            
-            if not leader_email and first_name:
-                leader_user = await users_collection.find_one({
-                    "$or": [
-                        {"name": first_name, "surname": surname},
-                        {"$expr": {"$eq": [
-                            {"$toLower": {"$concat": ["$name", " ", "$surname"]}},
-                            consolidation.assigned_to.lower()
-                        ]}}
-                    ]
-                })
-                if leader_user:
-                    leader_email = leader_user.get("email")
-                    print(f"Found leader email from users: {leader_email}")
+            print(f"Could not resolve Leader @12 or Leader @1 for: {consolidation.person_name} {consolidation.person_surname}")
 
         if leader_email:
             # Plan Change / Normalization: Lowercase email to ensure accurate database lookup
@@ -11579,7 +11834,7 @@ async def create_consolidation(
         else:
             source_display = "Manual"
             
-        assigned_for = leader_email if leader_email else consolidation.assigned_to
+        assigned_for = (resolved_assignee.get("display_name") if resolved_assignee else None) or (leader_email if leader_email else _normalize_text(consolidation.assigned_to))
        
         # 3. Create task
         task_doc = {
@@ -11587,13 +11842,19 @@ async def create_consolidation(
             "name": f"Consolidation: {consolidation.person_name} {consolidation.person_surname} ({decision_display_name})",
             "taskType": "consolidation",
             "description": f"Follow up with {consolidation.person_name} {consolidation.person_surname} who made a {decision_display_name.lower()} on {consolidation.decision_date} ({source_display} Consolidation)",
-            "followup_date": datetime.utcnow().isoformat(),
+            "followup_date": datetime.utcnow(),
             "status": "Open",
             "assignedfor": assigned_for,
             "assigned_to_email": leader_email,
             "assigned_to_user_id": leader_user_id,
             "leader_assigned": consolidation.assigned_to,
             "leader_name": consolidation.assigned_to,
+            "resolved_assignee": assigned_for,
+            "resolved_assignee_email": leader_email,
+            "resolved_assignee_user_id": leader_user_id,
+            "assignment_reason": assignment_reason,
+            "person_lookup_status": person_lookup_status,
+            "dedup_key": dedup_key,
             "type": "followup",
             "priority": "high",
             "consolidation_id": consolidation_id,
@@ -11609,7 +11870,7 @@ async def create_consolidation(
                 "email": person_email,
                 "phone": consolidation.person_phone or ""
             },
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.utcnow(),
             "created_by": current_user.get("email", ""),
             "is_consolidation_task": True
         }
@@ -11629,6 +11890,10 @@ async def create_consolidation(
             "decision_display_name": decision_display_name,
             "assigned_to": consolidation.assigned_to,
             "assigned_to_email": leader_email,
+            "resolved_assignee": assigned_for,
+            "resolved_assignee_email": leader_email,
+            "resolved_assignee_user_id": leader_user_id,
+            "assignment_reason": assignment_reason,
             "created_at": datetime.utcnow().isoformat(),
             "type": "consolidation",
             "status": "active",
@@ -11695,6 +11960,12 @@ async def create_consolidation(
             "assigned_to": consolidation.assigned_to,
             "assigned_to_email": leader_email,
             "assigned_to_user_id": leader_user_id,
+            "resolved_assignee": assigned_for,
+            "resolved_assignee_email": leader_email,
+            "resolved_assignee_user_id": leader_user_id,
+            "assignment_reason": assignment_reason,
+            "person_lookup_status": person_lookup_status,
+            "dedup_key": dedup_key,
             "event_id": consolidation.event_id,
             "notes": consolidation.notes,
             "created_by": current_user.get("email", ""),
@@ -11712,13 +11983,14 @@ async def create_consolidation(
         total_people_count = await people_collection.count_documents({})
 
         return {
-            "message": f"{decision_display_name} recorded successfully and assigned to {consolidation.assigned_to}",
+            "message": f"{decision_display_name} recorded successfully and assigned to {assigned_for}",
             "consolidation_id": consolidation_id,
             "person_id": person_id,
             "task_id": task_id,
             "decision_type": consolidation.decision_type.value,
-            "assigned_to": consolidation.assigned_to,
+            "assigned_to": assigned_for,
             "assigned_to_email": leader_email,
+            "assignment_reason": assignment_reason,
             "leader_user_id": leader_user_id,
             "people_count_updated": total_people_count,
             "success": True
@@ -11728,8 +12000,9 @@ async def create_consolidation(
         print(f"Error creating consolidation: {str(e)}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error creating consolidation: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error creating consolidation: {str(e)}")  
     
+ 
 @app.get("/api/users")
 async def get_all_users():
     try:
@@ -13665,6 +13938,24 @@ async def create_consolidation(
         person_email = person_data.get("email", "")
         person_phone = person_data.get("phone", "") or person_data.get("number", "")
         person_id = person_data.get("id", "")
+        
+        # ── SERVER-SIDE RESOLUTION: always Leader @12, fall back to Leader @1 ──
+        person_context = None
+        if person_id and ObjectId.is_valid(person_id):
+            person_context = await people_collection.find_one({"_id": ObjectId(person_id)})
+        if not person_context and person_email:
+            person_context = await people_collection.find_one(
+                {"Email": {"$regex": f"^{re.escape(person_email)}$", "$options": "i"}}
+            )
+
+        resolved_assignee = await resolve_leader_at_12_with_fallback(person_context, None, current_user)
+        leader_email = resolved_assignee.get("email") if resolved_assignee else None
+        leader_user_id = resolved_assignee.get("user_id") if resolved_assignee else None
+        assignment_reason = resolved_assignee.get("reason") if resolved_assignee else "no_valid_leader_found"
+        assigned_to = (resolved_assignee.get("display_name") if resolved_assignee else None) or "Unassigned"
+
+        if not leader_email:
+            print(f"Could not resolve Leader @12 or Leader @1 for: {person_name} {person_surname}")
 
         # Create task
         task_payload = {
@@ -13679,8 +13970,8 @@ async def create_consolidation(
             "followup_date": datetime.utcnow().isoformat(),
             "status": "Open",
             "type": "consolidation",
-            "assignedfor": consolidation_data.get("assigned_to_email") or current_user.get("email", "unknown"),
-            "assigned_to_email": consolidation_data.get("assigned_to_email") or "",
+            "assignedfor": leader_email or consolidation_data.get("assigned_to_email") or current_user.get("email", "unknown"),
+            "assigned_to_email": leader_email or consolidation_data.get("assigned_to_email") or "",
             "is_consolidation_task": True,
             "leader_assigned": assigned_to,
             "leader_name": assigned_to,
@@ -13713,6 +14004,7 @@ async def create_consolidation(
             "person_phone": person_phone,
             "decision_type": decision_type,
             "assigned_to": assigned_to,
+            "assigned_to_email": leader_email,
             "notes": notes,
             "created_by": current_user.get("email", "unknown"),
             "created_by_name": current_user.get("name", "Unknown"),
