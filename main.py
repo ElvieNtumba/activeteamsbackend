@@ -3462,7 +3462,7 @@ def convert_event_for_display(event):
 #         traceback.print_exc()
 #         raise HTTPException(status_code=500, detail=str(e))
 
-# #----------------Deactivate cells Endpoints------------
+# ----------------Deactivate cells Endpoints------------
 # @app.put("/events/deactivate")
 # async def deactivate_event(
 #     cell_identifier: str = Query(..., description="Cell name or Person name"),
