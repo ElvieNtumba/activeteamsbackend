@@ -12,13 +12,19 @@ from supabase_helpers.supabase_connection import supabase
 
 # if not SUPABASE_URL or not SUPABASE_KEY:
 #     raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in environment")
+import os 
+from motor.motor_asyncio import AsyncIOMotorClient 
+from dotenv import load_dotenv 
+
+load_dotenv() 
 
 
-class ObjectId(str):
-    def __new__(cls, value: Optional[Any] = None):
-        if value is None:
-            value = str(uuid.uuid4())
-        return str.__new__(cls, str(value))
+MONGO_URI = os.getenv("MONGO_URI","None")
+DB_NAME = os.getenv("DB_NAME", "active-teams-db")
+
+print(f"--- CONNECTING TO DB: {DB_NAME} ---")
+
+client = AsyncIOMotorClient(MONGO_URI)
 
 #     @staticmethod
 #     def is_valid(value: Any) -> bool:
@@ -645,7 +651,7 @@ load_dotenv()
 
 
 MONGO_URI = os.getenv("MONGO_URI","None")
-DB_NAME = "test-data-active-teams"
+DB_NAME = "active-teams-db"
 # os.getenv("DB_NAME", "active-teams-db")
 
 print(f"--- CONNECTING TO DB: {DB_NAME} ---")
