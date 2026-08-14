@@ -70,9 +70,14 @@ class AttendanceSubmission(BaseModel):
     attendees: List[Attendee]
     leaderEmail: str
     leaderName: str
+    leader12: str
     did_not_meet: bool = False
     isTicketed: bool = False
     invitedBy: Optional[str] = None
+    session_id: str
+    event_id: str
+    event_name: str
+    
 
     @field_validator("attendees", mode="before")
     def validate_attendance(cls, v, info):
@@ -421,6 +426,8 @@ class ConsolidationCreate(BaseModel):
     attendance_status: str = "checked_in"
     notes: Optional[str] = ""
     source: ConsolidationSource = ConsolidationSource.MANUAL
+    person_id:str
+    session_id:str
 
 class ConsolidationTask(TaskModel):
     consolidation_id: str
