@@ -43,7 +43,8 @@ app.add_middleware(
         "http://localhost:5173",  
         "https://test-active-teams.netlify.app",
         "https://activeteamsbackend2.0.onrender.com",
-        "https://activeteamsbackend-production.up.railway.app"
+        "https://activeteamsbackend-production.up.railway.app",
+        "https://activeteamsbackend.onrender.com"
     ],
     allow_credentials=True,
     allow_methods=["*"],
