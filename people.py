@@ -348,24 +348,26 @@ async def create_person(person_data: PersonCreate):
         # Insert into MongoDB
         result = await people_collection.insert_one(person_doc)
 
-        # Return the created person object
+        created_doc = await people_collection.find_one({"_id": result.inserted_id})
+        created_doc = created_doc or person_doc
+
         created_person = {
             "_id": str(result.inserted_id),
-            "Name": person_doc["Name"],
-            "Surname": person_doc["Surname"],
-            "Email": person_doc["Email"],
-            "Number": person_doc["Number"],
-            "Gender": person_doc["Gender"],
-            "Birthday": person_doc["Birthday"],
-            "Address": person_doc["Address"],
-            "InvitedBy": person_doc["InvitedBy"],
-            "Leader @1": person_doc["Leader @1"],
-            "Leader @12": person_doc["Leader @12"],
-            "Leader @144": person_doc["Leader @144"],
-            "Leader @1728": person_doc["Leader @1728"],
-            "Stage": person_doc["Stage"],
-            "Date Created": person_doc["Date Created"],
-            "UpdatedAt": person_doc["UpdatedAt"]
+            "Name": created_doc.get("Name", ""),
+            "Surname": created_doc.get("Surname", ""),
+            "Email": created_doc.get("Email", ""),
+            "Number": created_doc.get("Number", ""),
+            "Gender": created_doc.get("Gender", ""),
+            "Birthday": created_doc.get("Birthday", ""),
+            "Address": created_doc.get("Address", ""),
+            "InvitedBy": created_doc.get("InvitedBy", ""),
+            "Leader @1": created_doc.get("Leader @1", ""),
+            "Leader @12": created_doc.get("Leader @12", ""),
+            "Leader @144": created_doc.get("Leader @144", ""),
+            "Leader @1728": created_doc.get("Leader @1728", ""),
+            "Stage": created_doc.get("Stage", "Win"),
+            "Date Created": created_doc.get("Date Created", ""),
+            "UpdatedAt": created_doc.get("UpdatedAt", "")
         }
 
         return {
