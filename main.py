@@ -355,6 +355,51 @@ def get_attendance_by_date(attendance_data: dict, exact_date: str) -> dict:
     return {}
 
 
+def merge_attendance_people(attendees: list, persistent_attendees: list) -> list:
+    """Include associated event people without duplicating live attendance rows."""
+    merged = list(attendees) if isinstance(attendees, list) else []
+    existing_ids = {
+        str(attendee.get("id") or attendee.get("_id"))
+        for attendee in merged
+        if isinstance(attendee, dict) and (attendee.get("id") or attendee.get("_id"))
+    }
+    for person in persistent_attendees or []:
+        if not isinstance(person, dict):
+            continue
+        person = dict(person)
+        person["leader1"] = person.get("leader1") or person.get("Leader @1", "")
+        person["leader12"] = person.get("leader12") or person.get("Leader @12", "")
+        person["leader144"] = person.get("leader144") or person.get("Leader @144", "")
+        person["leader1728"] = person.get("leader1728") or person.get("Leader @1728", "")
+        person_id = str(person.get("id") or person.get("_id") or "")
+        if person_id and person_id not in existing_ids:
+            merged.append(person)
+            existing_ids.add(person_id)
+    return merged
+
+
+async def associate_persistent_attendee(event_id: ObjectId, attendee: dict):
+    """Associate a checked-in People record with an event exactly once."""
+    attendee_id = str(attendee.get("id") or "").strip()
+    if not attendee_id:
+        return
+
+    persistent_attendee = dict(attendee)
+    persistent_attendee["isPersistent"] = True
+    persistent_attendee["checked_in"] = False
+
+    await events_collection.update_one(
+        {
+            "_id": event_id,
+            "persistent_attendees.id": {"$ne": attendee_id},
+        },
+        {
+            "$push": {"persistent_attendees": persistent_attendee},
+            "$set": {"updated_at": datetime.utcnow()},
+        },
+    )
+
+
 async def user_has_cell(user_email: str) -> bool:
     """Return True if the user (email) has at least one cell event."""
     if not user_email:
@@ -3009,6 +3054,10 @@ async def get_other_events(
                             weekly_attendees = date_attendance.get("attendees", [])
                             if not isinstance(weekly_attendees, list):
                                 weekly_attendees = []
+                            weekly_attendees = merge_attendance_people(
+                                weekly_attendees,
+                                event.get("persistent_attendees", [])
+                            )
                             
                             # Enrich attendees with financial data
                             weekly_attendees = enrich_attendees_with_financials(weekly_attendees)
@@ -3120,6 +3169,11 @@ async def get_other_events(
                             weekly_attendees = event_attendance.get("attendees", [])
                             if not isinstance(weekly_attendees, list):
                                 weekly_attendees = []
+
+                    weekly_attendees = merge_attendance_people(
+                        weekly_attendees,
+                        event.get("persistent_attendees", [])
+                    )
 
                     # Helper function to enrich attendees with financial data
                     def enrich_attendees_with_financials(attendees_list):
@@ -7096,18 +7150,16 @@ async def submit_attendance(
         weekly_attendance = len(checked_in_attendees)
         total_decisions = first_time_count + recommitment_count
         
-        # Determine status
-        should_mark_as_did_not_meet = (did_not_meet and weekly_attendance == 0 and manual_headcount == 0)
-        
-        if should_mark_as_did_not_meet:
-            date_status = "did_not_meet"
-            has_attendance = False
-        elif weekly_attendance == 0 and manual_headcount == 0:
-            date_status = "incomplete"
-            has_attendance = False
-        else:
-            date_status = "complete"
-            has_attendance = True
+        # Individual check-ins are written immediately by the live check-in
+        # endpoints. SAVE only finalizes this instance; it must never replace
+        # the live roster with the modal's stale local state.
+        stored_instance = get_attendance_by_date(event.get("attendance", {}) or {}, exact_date_str) or {}
+        stored_attendees = stored_instance.get("attendees", [])
+        if not stored_attendees and not event.get("attendance"):
+            stored_attendees = event.get("attendees", [])  # legacy read fallback
+        weekly_attendance = len([a for a in stored_attendees if isinstance(a, dict) and a.get("checked_in", True)])
+        date_status = "did_not_meet" if did_not_meet else "complete"
+        has_attendance = True
         
         now = datetime.now(timezone)
         
@@ -7139,7 +7191,7 @@ async def submit_attendance(
             }
         }
         
-        # Prepare update fields
+        # Do not set attendance.{date} as a whole: that would erase live work.
         update_data = {
             "updated_at": now,
             "last_attendance_count": weekly_attendance,
@@ -7147,21 +7199,17 @@ async def submit_attendance(
             "last_attendance_date": exact_date_str,
             "last_status": date_status,
             "status": date_status,
-            f"attendance.{exact_date_str}": weekly_attendance_entry
+            f"attendance.{exact_date_str}.status": date_status,
+            f"attendance.{exact_date_str}.total_headcounts": manual_headcount,
+            f"attendance.{exact_date_str}.is_did_not_meet": did_not_meet,
+            f"attendance.{exact_date_str}.submitted_at": now,
+            f"attendance.{exact_date_str}.submitted_by": user_email,
+            f"attendance.{exact_date_str}.submitted_by_name": user_name,
+            f"attendance.{exact_date_str}.event_date_iso": exact_date_str,
+            f"attendance.{exact_date_str}.event_date_exact": exact_date_str,
+            f"attendance.{exact_date_str}.checked_in_count": weekly_attendance,
         }
         
-        # Update persistent attendees if provided
-        if persistent_attendees_dict:
-            update_data["persistent_attendees"] = persistent_attendees_dict
-            update_data["total_associated_count"] = len(persistent_attendees_dict)
-        
-        # For non-recurring events, update root-level attendees
-        recurring_days = event.get("recurring_day", [])
-        is_recurring = isinstance(recurring_days, list) and len(recurring_days) > 0
-        
-        if not is_recurring and date_status == "complete":
-            update_data["attendees"] = checked_in_attendees
-            update_data["total_attendance"] = weekly_attendance
         
         # Execute update
         result = await events_collection.update_one(
@@ -7251,8 +7299,10 @@ async def update_persistent_attendees(
                 "fullName": attendee.get("fullName", attendee.get("name", "")),
                 "email": attendee.get("email", ""),
                 "phone": attendee.get("phone", ""),
-                "leader12": attendee.get("leader12", ""),
-                "leader144": attendee.get("leader144", ""),
+                "leader1": attendee.get("leader1") or attendee.get("Leader @1", ""),
+                "leader12": attendee.get("leader12") or attendee.get("Leader @12", ""),
+                "leader144": attendee.get("leader144") or attendee.get("Leader @144", ""),
+                "leader1728": attendee.get("leader1728") or attendee.get("Leader @1728", ""),
                 "invitedBy": attendee.get("invitedBy", ""),
                 "isPersistent": True,
                 # Ticket information
@@ -7395,9 +7445,6 @@ async def get_persistent_attendees(
             checked_in_from_db  = []
             total_headcounts    = 0
 
-        # Only expose checked-in attendees when the week is actually complete.
-        is_complete = attendance_status == "complete"
-
         # ── Build enriched persistent list ───────────────────────────────────
         # Index the checked-in rows by id for O(1) lookup.
         checked_in_index = {
@@ -7438,8 +7485,8 @@ async def get_persistent_attendees(
                 "check_in_date": "",
             }
 
-            # Only override with per-week data when this week is complete
-            if is_complete and checked_in_data:
+            # Per-instance data is live; it is not gated behind finalization.
+            if checked_in_data:
                 enriched["checked_in"]    = checked_in_data.get("checked_in", True)
                 enriched["decision"]      = checked_in_data.get("decision", "")
                 enriched["check_in_date"] = checked_in_data.get("check_in_date", "")
@@ -7463,7 +7510,7 @@ async def get_persistent_attendees(
 
         # ── Build checked-in list (only meaningful when complete) ────────────
         checked_in_list = []
-        if is_complete:
+        if checked_in_from_db:
             for att in checked_in_from_db:
                 if not isinstance(att, dict):
                     continue
@@ -7489,7 +7536,9 @@ async def get_persistent_attendees(
 
         return {
             "persistent_attendees":  enriched_attendees,
-            "checked_in_attendees":  checked_in_list,
+            # During a live service this list is intentionally available even
+            # before SAVE marks the instance complete.
+            "checked_in_attendees":  checked_in_list or checked_in_from_db,
             "attendance_status":     attendance_status,   # "incomplete" | "complete" | "did_not_meet"
             "total_headcounts":      total_headcounts,
             "event_date":            exact_date_str,
@@ -7948,7 +7997,21 @@ async def check_in_person(checkin: CheckIn):
             raise HTTPException(status_code=400, detail="Person already checked in")
 
         attendee_record = {
-            "name": checkin.name,
+            "id": str(person.get("_id", "")),
+            "name": person.get("Name", checkin.name),
+            "fullName": f"{person.get('Name', '')} {person.get('Surname', '')}".strip(),
+            "surname": person.get("Surname", ""),
+            "gender": person.get("Gender", ""),
+            "birthday": person.get("Birthday", ""),
+            "address": person.get("Address", ""),
+            "stage": person.get("Stage", ""),
+            "email": person.get("Email", ""),
+            "phone": person.get("Number", ""),
+            "invitedBy": person.get("InvitedBy", ""),
+            "leader1": person.get("Leader @1") or person.get("leader1", ""),
+            "leader12": person.get("Leader @12") or person.get("leader12", ""),
+            "leader144": person.get("Leader @144") or person.get("leader144", ""),
+            "leader1728": person.get("Leader @1728") or person.get("leader1728", ""),
             "time": datetime.utcnow(),
         }
 
@@ -12431,10 +12494,17 @@ async def get_event_new_people(event_id: str = Path(...)):
                
                 if not existing_person:
                     new_people.append({
+                        "id": attendee.get("id"),
                         "name": attendee.get("name"),
                         "fullName": attendee.get("fullName"),
+                        "surname": attendee.get("surname"),
+                        "gender": attendee.get("gender"),
+                        "birthday": attendee.get("birthday"),
+                        "address": attendee.get("address"),
+                        "stage": attendee.get("stage"),
                         "email": email,
                         "phone": attendee.get("phone"),
+                        "invitedBy": attendee.get("invitedBy"),
                         "decision": attendee.get("decision"),
                         "attendance_time": attendee.get("time")
                     })
@@ -12467,37 +12537,56 @@ async def get_service_checkin_real_time_data(
         if not event:
             raise HTTPException(status_code=404, detail="Event not found")
  
-        is_recurring = bool(event.get("recurring_day"))
- 
-        if is_recurring:
-            if not instance_date:
+        if not instance_date:
+            event_date = event.get("date") or event.get("Date Of Event") or event.get("eventDate")
+            if isinstance(event_date, datetime):
+                instance_date = event_date.date().isoformat()
+            elif event_date:
+                try:
+                    instance_date = datetime.fromisoformat(str(event_date).replace("Z", "+00:00")).date().isoformat()
+                except ValueError:
+                    instance_date = str(event_date)[:10]
+            else:
                 tz = pytz.timezone("Africa/Johannesburg")
                 instance_date = datetime.now(tz).date().isoformat()
- 
-            attendance_data = event.get("attendance", {})
-            date_data = attendance_data.get(instance_date, {}) if isinstance(attendance_data, dict) else {}
- 
+
+        # This is the common live read source for every event type.  Keep a
+        # root-array fallback solely for records written before this migration.
+        attendance_data = event.get("attendance", {})
+        date_data = attendance_data.get(instance_date, {}) if isinstance(attendance_data, dict) else {}
+        if date_data:
             attendees = date_data.get("attendees", [])
             new_people = date_data.get("new_people", [])
             consolidations = date_data.get("consolidations", [])
- 
-            print(f"Recurring [{instance_date}]: {len(attendees)} att, {len(new_people)} new, {len(consolidations)} cons")
         else:
             attendees = event.get("attendees", [])
             new_people = event.get("new_people", [])
             consolidations = event.get("consolidations", [])
+
+        print(f"Live attendance [{instance_date}]: {len(attendees)} att, {len(new_people)} new, {len(consolidations)} cons")
  
         attendees = attendees if isinstance(attendees, list) else []
         new_people = new_people if isinstance(new_people, list) else []
         consolidations = consolidations if isinstance(consolidations, list) else []
- 
-        print(f"Real-time data returning: {len(attendees)} attendees, {len(new_people)} new, {len(consolidations)} consolidations")
+        associated_attendees = event.get("persistent_attendees", [])
+        associated_attendees = (
+            associated_attendees
+            if isinstance(associated_attendees, list)
+            else []
+        )
+
+        print(
+            f"Real-time data returning: {len(attendees)} present, "
+            f"{len(associated_attendees)} associated, {len(new_people)} new, "
+            f"{len(consolidations)} consolidations"
+        )
  
         return {
             "success": True,
             "event_id": event_id,
             "event_name": event.get("eventName", "Unknown Event"),
             "present_attendees": attendees,
+            "associated_attendees": associated_attendees,
             "new_people": new_people,
             "consolidations": consolidations,
             "present_count": len(attendees),
@@ -12572,6 +12661,18 @@ async def service_checkin_person(
         event_id = checkin_data.get("event_id")
         person_data = checkin_data.get("person_data", {})
         checkin_type = checkin_data.get("type", "attendee")
+        if isinstance(person_data, dict):
+            for field in ("decision", "priceName", "price", "ageGroup", "paymentMethod", "paidAmount", "paid"):
+                if field in checkin_data:
+                    person_data[field] = checkin_data[field]
+
+        # Service Check-In may receive a generated recurring instance ID.
+        # Normalize it so both screens mutate the same base document/date.
+        if event_id and "_" in event_id:
+            base_event_id, _, date_suffix = event_id.partition("_")
+            if ObjectId.is_valid(base_event_id):
+                event_id = base_event_id
+                checkin_data.setdefault("date", date_suffix)
  
         if not event_id or not ObjectId.is_valid(event_id):
             raise HTTPException(status_code=400, detail="Invalid event ID")
@@ -12580,33 +12681,136 @@ async def service_checkin_person(
         if not event:
             raise HTTPException(status_code=404, detail="Event not found")
  
-        is_recurring = bool(event.get("recurring_day"))
+        # All live attendance, including one-off events, is date scoped.
+        # `date` lets the Events modal update its displayed instance instead
+        # of relying on the server's current date.
+        is_recurring = True
         now = datetime.utcnow().isoformat()
- 
-        instance_date = None
-        if is_recurring:
+        instance_date = checkin_data.get("date") or checkin_data.get("instance_date")
+        if instance_date:
+            try:
+                instance_date = datetime.strptime(str(instance_date)[:10], "%Y-%m-%d").date().isoformat()
+            except ValueError:
+                raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+        else:
             tz = pytz.timezone("Africa/Johannesburg")
             instance_date = datetime.now(tz).date().isoformat()
- 
+
+        # Never reopen a completed instance when a late ticket edit arrives.
+        await events_collection.update_one(
+            {"_id": ObjectId(event_id), f"attendance.{instance_date}.status": {"$exists": False}},
+            {"$set": {f"attendance.{instance_date}.status": "incomplete"}}
+        )
+
         if checkin_type == "attendee":
-            person_id = person_data.get("id") or person_data.get("_id")
+            person_id = person_data.get("id") or person_data.get("_id") or person_data.get("person_id")
+            # Handle temporary new_person IDs - convert to real person in DB
+            if person_id and isinstance(person_id, str) and person_id.startswith("new_"):
+                print(f"Converting new_person {person_id} to real person...")
+
+                # Resolve leader path if invitedBy is provided
+                leader_path = []
+                leader_id_obj = None
+
+                if person_data.get("invitedBy"):
+                    inviter_name = person_data.get("invitedBy", "").strip()
+                    if inviter_name:
+                        parts = inviter_name.split()
+                        first = parts[0] if parts else ""
+                        last = " ".join(parts[1:]) if len(parts) > 1 else ""
+
+                        inviter_query = {
+                            "Name": {"$regex": f"^{re.escape(first)}$", "$options": "i"}
+                        }
+                        if last:
+                            inviter_query["Surname"] = {"$regex": f"^{re.escape(last)}$", "$options": "i"}
+
+                        inviter = await people_collection.find_one(
+                            inviter_query,
+                            {"_id": 1, "LeaderPath": 1}
+                        )
+                        if inviter:
+                            leader_id_obj = inviter["_id"]
+                            leader_path = inviter.get("LeaderPath", [])
+
+                # Create person in people collection
+                new_person_doc = {
+                    "Name": (person_data.get("name") or "").title(),
+                    "Surname": (person_data.get("surname") or "").title(),
+                    "Email": (person_data.get("email") or "").lower().strip(),
+                    "Number": person_data.get("phone") or "",
+                    "Gender": person_data.get("gender") or "",
+                    "Birthday": person_data.get("birthday") or "",
+                    "Address": person_data.get("address") or "",
+                    "Stage": person_data.get("stage") or "Win",
+                    "InvitedBy": person_data.get("invitedBy") or "",
+                    "Leader @1": person_data.get("leader1") or "",
+                    "Leader @12": person_data.get("leader12") or "",
+                    "Leader @144": person_data.get("leader144") or "",
+                    "Leader @1728": person_data.get("leader1728") or "",
+                    "LeaderId": leader_id_obj,
+                    "LeaderPath": leader_path,
+                    "org_id": current_user.get("org_id") or "active-teams",
+                    "Organization": current_user.get("Organization") or "",
+                    "DateCreated": now,
+                    "UpdatedAt": now
+                }
+                result = await people_collection.insert_one(new_person_doc)
+                person_id = str(result.inserted_id)
+                print(f"Created person with ID: {person_id}")
+
+                # Keep the original new_people record. New and checked-in are
+                # independent statuses, so this person remains new after check-in.
+
             if not person_id or not ObjectId.is_valid(person_id):
                 raise HTTPException(status_code=400, detail="Valid person ID is required")
  
             existing = await people_collection.find_one({"_id": ObjectId(person_id)})
             if not existing:
                 raise HTTPException(status_code=404, detail="Person does not exist")
- 
+
+            existing_date_attendance = event.get("attendance", {}).get(instance_date, {})
+            existing_record = next(
+                (row for row in existing_date_attendance.get("attendees", []) if row.get("id") == str(existing["_id"])),
+                {}
+            )
             attendee_record = {
+                **existing_record,
                 "id": str(existing["_id"]),
                 "name": existing.get("Name", ""),
+                "fullName": f"{existing.get('Name', '')} {existing.get('Surname', '')}".strip(),
                 "surname": existing.get("Surname", ""),
+                "gender": existing.get("Gender", ""),
+                "birthday": existing.get("Birthday", ""),
+                "address": existing.get("Address", ""),
+                "stage": existing.get("Stage", ""),
                 "email": existing.get("Email", ""),
                 "phone": existing.get("Number", ""),
+                "invitedBy": existing.get("InvitedBy", ""),
+                "leader1": existing.get("Leader @1") or existing.get("leader1", ""),
+                "leader12": existing.get("Leader @12") or existing.get("leader12", ""),
+                "leader144": existing.get("Leader @144") or existing.get("leader144", ""),
+                "leader1728": existing.get("Leader @1728") or existing.get("leader1728", ""),
                 "time": now,
                 "checked_in": True,
-                "type": "attendee"
+                "type": "attendee",
+                "check_in_date": now,
             }
+            # Preserve ticket/decision values unless this live action supplies
+            # a replacement. This makes partial debounce updates safe.
+            for field in ("decision", "priceName", "price", "ageGroup", "paymentMethod", "paidAmount", "paid"):
+                if field in person_data:
+                    attendee_record[field] = person_data[field]
+            if "paidAmount" in attendee_record and "paid" not in person_data:
+                attendee_record["paid"] = attendee_record["paidAmount"]
+            try:
+                price = float(attendee_record.get("price") or 0)
+                paid = float(attendee_record.get("paidAmount", attendee_record.get("paid", 0)) or 0)
+                attendee_record.update({"paid": paid, "paidAmount": paid, "owing": max(price - paid, 0), "change": max(paid - price, 0)})
+            except (TypeError, ValueError):
+                pass
+
+            await associate_persistent_attendee(ObjectId(event_id), attendee_record)
  
             if is_recurring:
                 result = await events_collection.update_one(
@@ -12636,7 +12840,15 @@ async def service_checkin_person(
                 )
  
             if result.modified_count == 0:
-                raise HTTPException(status_code=400, detail=f"{existing.get('Name')} is already checked in")
+                # A second action is an update, not an error: decisions and
+                # ticket values are edited independently from check-in.
+                result = await events_collection.update_one(
+                    {"_id": ObjectId(event_id), f"attendance.{instance_date}.attendees.id": attendee_record["id"]},
+                    {"$set": {f"attendance.{instance_date}.attendees.$": attendee_record,
+                              f"attendance.{instance_date}.updated_at": now, "updated_at": now}}
+                )
+                if result.matched_count == 0:
+                    raise HTTPException(status_code=404, detail="Attendee could not be updated")
  
             updated_event = await events_collection.find_one({"_id": ObjectId(event_id)})
             if is_recurring:
@@ -12658,11 +12870,19 @@ async def service_checkin_person(
             new_person_record = {
                 "id": new_person_id,
                 "name": person_data.get("name", ""),
+                "fullName": f"{person_data.get('name', '')} {person_data.get('surname', '')}".strip(),
                 "surname": person_data.get("surname", ""),
                 "email": person_data.get("email", ""),
                 "phone": person_data.get("phone", ""),
                 "gender": person_data.get("gender", ""),
+                "birthday": person_data.get("birthday", ""),
+                "address": person_data.get("address", ""),
+                "stage": person_data.get("stage", ""),
                 "invitedBy": person_data.get("invitedBy", ""),
+                "leader1": person_data.get("leader1", ""),
+                "leader12": person_data.get("leader12", ""),
+                "leader144": person_data.get("leader144", ""),
+                "leader1728": person_data.get("leader1728", ""),
                 "added_at": now,
                 "type": "new_person",
                 "is_checked_in": True
@@ -12707,6 +12927,39 @@ async def service_checkin_person(
         raise HTTPException(status_code=500, detail="Check-in failed")
  
  
+@app.put("/events/{event_id}/attendance/{attendance_date}/checkin")
+async def upsert_event_attendance_checkin(
+    event_id: str,
+    attendance_date: str,
+    checkin_data: dict = Body(...),
+    current_user: dict = Depends(get_current_user)
+):
+    """Persist one attendee's live check-in, decision and ticket fields."""
+    try:
+        datetime.strptime(attendance_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="attendance_date must be YYYY-MM-DD")
+
+    payload = dict(checkin_data)
+    payload["event_id"] = event_id
+    payload["date"] = attendance_date
+    payload["type"] = "attendee"
+    # Support both the Events-modal flat payload and Service Check-In's
+    # person_data envelope without maintaining a second mutation path.
+    if "person_data" not in payload:
+        payload["person_data"] = {
+            key: value for key, value in payload.items()
+            if key not in {"event_id", "date", "instance_date", "type"}
+        }
+    else:
+        # Also accept ticket fields at the top level for clients that keep
+        # identity under person_data but edit ticket inputs separately.
+        for field in ("decision", "priceName", "price", "ageGroup", "paymentMethod", "paidAmount", "paid"):
+            if field in payload:
+                payload["person_data"][field] = payload[field]
+    return await service_checkin_person(payload, current_user)
+
+
 @app.delete("/service-checkin/remove")
 async def remove_from_service_checkin(
     removal_data: dict = Body(...),
@@ -12716,6 +12969,12 @@ async def remove_from_service_checkin(
         event_id = removal_data.get("event_id")
         person_id = removal_data.get("person_id")
         data_type = removal_data.get("type")
+
+        if event_id and "_" in event_id:
+            base_event_id, _, date_suffix = event_id.partition("_")
+            if ObjectId.is_valid(base_event_id):
+                event_id = base_event_id
+                removal_data.setdefault("date", date_suffix)
  
         if not event_id or not ObjectId.is_valid(event_id):
             raise HTTPException(status_code=400, detail="Invalid event ID")
@@ -12731,12 +12990,21 @@ async def remove_from_service_checkin(
         if not event:
             raise HTTPException(status_code=404, detail="Event not found")
  
-        is_recurring = bool(event.get("recurring_day"))
+        # Match the date-scoped live write path used for both recurring and
+        # one-off events.  A caller may explicitly remove from an instance.
+        is_recurring = True
         now = datetime.utcnow().isoformat()
- 
-        if is_recurring:
+        instance_date = removal_data.get("date") or removal_data.get("instance_date")
+        if instance_date:
+            try:
+                instance_date = datetime.strptime(str(instance_date)[:10], "%Y-%m-%d").date().isoformat()
+            except ValueError:
+                raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+        else:
             tz = pytz.timezone("Africa/Johannesburg")
             instance_date = datetime.now(tz).date().isoformat()
+
+        if is_recurring:
  
             result = await events_collection.update_one(
                 {"_id": ObjectId(event_id)},
@@ -13930,10 +14198,20 @@ async def create_consolidation(
 
         is_recurring = bool(event.get("recurring_day"))
 
-        # If recurring and no date provided, use today (Joburg time)
-        if is_recurring and not instance_date:
-            timezone = pytz.timezone("Africa/Johannesburg")
-            instance_date = datetime.now(timezone).date().isoformat()
+        # When no instance suffix is supplied, use the event's own date so
+        # polling reads the same attendance bucket that creation updates.
+        if not instance_date:
+            event_date = event.get("date") or event.get("Date Of Event") or event.get("eventDate")
+            if isinstance(event_date, datetime):
+                instance_date = event_date.date().isoformat()
+            elif event_date:
+                try:
+                    instance_date = datetime.fromisoformat(str(event_date).replace("Z", "+00:00")).date().isoformat()
+                except ValueError:
+                    instance_date = str(event_date)[:10]
+            else:
+                timezone = pytz.timezone("Africa/Johannesburg")
+                instance_date = datetime.now(timezone).date().isoformat()
 
         person_name = person_data.get("name", "")
         person_surname = person_data.get("surname", "")
@@ -14016,25 +14294,15 @@ async def create_consolidation(
             "source": "service_checkin"
         }
 
-        # ── Write to the correct location based on recurring vs non-recurring ──
-        if is_recurring:
-            # Push into the nested attendance[date].consolidations array
-            result = await events_collection.update_one(
-                {"_id": ObjectId(base_event_id)},
-                {
-                    "$push": {f"attendance.{instance_date}.consolidations": consolidation_record},
-                    "$set": {"updated_at": datetime.utcnow().isoformat()}
-                }
-            )
-        else:
-            # Push into the root consolidations array (original behaviour)
-            result = await events_collection.update_one(
-                {"_id": ObjectId(base_event_id)},
-                {
-                    "$push": {"consolidations": consolidation_record},
-                    "$set": {"updated_at": datetime.utcnow().isoformat()}
-                }
-            )
+        # All service-check-in activity is date scoped, including one-off
+        # events. Keep consolidations in the same canonical attendance bucket.
+        result = await events_collection.update_one(
+            {"_id": ObjectId(base_event_id)},
+            {
+                "$push": {f"attendance.{instance_date}.consolidations": consolidation_record},
+                "$set": {"updated_at": datetime.utcnow().isoformat()}
+            }
+        )
 
         if result.modified_count == 0:
             await tasks_collection.delete_one({"_id": ObjectId(task_id)})
@@ -14060,13 +14328,14 @@ async def create_consolidation(
 
         updated_event = await events_collection.find_one({"_id": ObjectId(base_event_id)})
 
-        # Get correct count based on recurring
+        # Read the count from the canonical date-scoped location.
         if is_recurring:
             attendance_data = updated_event.get("attendance", {})
             date_data = attendance_data.get(instance_date, {})
             cons_count = len(date_data.get("consolidations", []))
         else:
-            cons_count = len(updated_event.get("consolidations", []))
+            date_data = updated_event.get("attendance", {}).get(instance_date, {})
+            cons_count = len(date_data.get("consolidations", []))
 
         return {
             "success": True,
@@ -14110,18 +14379,24 @@ async def remove_consolidation(
         is_recurring = bool(event.get("recurring_day"))
         now = datetime.utcnow().isoformat()
 
-        # Determine instance date for recurring events
-        if is_recurring and not instance_date:
-            timezone = pytz.timezone("Africa/Johannesburg")
-            instance_date = datetime.now(timezone).date().isoformat()
+        # Resolve the same canonical attendance date used during creation.
+        if not instance_date:
+            event_date = event.get("date") or event.get("Date Of Event") or event.get("eventDate")
+            if isinstance(event_date, datetime):
+                instance_date = event_date.date().isoformat()
+            elif event_date:
+                try:
+                    instance_date = datetime.fromisoformat(str(event_date).replace("Z", "+00:00")).date().isoformat()
+                except ValueError:
+                    instance_date = str(event_date)[:10]
+            else:
+                timezone = pytz.timezone("Africa/Johannesburg")
+                instance_date = datetime.now(timezone).date().isoformat()
 
-        # Find the consolidation in the right place
-        if is_recurring:
-            attendance_data = event.get("attendance", {})
-            date_data = attendance_data.get(instance_date, {}) if isinstance(attendance_data, dict) else {}
-            consolidations_list = date_data.get("consolidations", [])
-        else:
-            consolidations_list = event.get("consolidations", [])
+        # Find the consolidation in the canonical date-scoped location.
+        attendance_data = event.get("attendance", {})
+        date_data = attendance_data.get(instance_date, {}) if isinstance(attendance_data, dict) else {}
+        consolidations_list = date_data.get("consolidations", [])
 
         consolidation_to_remove = None
         updated_consolidations = []
@@ -14138,23 +14413,17 @@ async def remove_consolidation(
         person_name = consolidation_to_remove.get("person_name", "")
         person_surname = consolidation_to_remove.get("person_surname", "")
 
-        # Write updated consolidations back to the right place
-        if is_recurring:
-            await events_collection.update_one(
-                {"_id": ObjectId(base_event_id)},
-                {
-                    "$set": {
-                        f"attendance.{instance_date}.consolidations": updated_consolidations,
-                        f"attendance.{instance_date}.updated_at": now,
-                        "updated_at": now
-                    }
+        # Write the updated list back to the canonical location.
+        await events_collection.update_one(
+            {"_id": ObjectId(base_event_id)},
+            {
+                "$set": {
+                    f"attendance.{instance_date}.consolidations": updated_consolidations,
+                    f"attendance.{instance_date}.updated_at": now,
+                    "updated_at": now
                 }
-            )
-        else:
-            await events_collection.update_one(
-                {"_id": ObjectId(base_event_id)},
-                {"$set": {"consolidations": updated_consolidations, "updated_at": now}}
-            )
+            }
+        )
 
         # Delete from consolidations collection
         consolidations_col = db["consolidations"]
@@ -14181,19 +14450,12 @@ async def remove_consolidation(
 
         # Get updated stats
         updated_event = await events_collection.find_one({"_id": ObjectId(base_event_id)})
-        if is_recurring:
-            date_data = updated_event.get("attendance", {}).get(instance_date, {})
-            stats = {
-                "consolidations_count": len(date_data.get("consolidations", [])),
-                "new_people_count": len(date_data.get("new_people", [])),
-                "total_attendance": len(date_data.get("attendees", []))
-            }
-        else:
-            stats = {
-                "consolidations_count": len(updated_event.get("consolidations", [])),
-                "new_people_count": len(updated_event.get("new_people", [])),
-                "total_attendance": updated_event.get("total_attendance", 0)
-            }
+        date_data = updated_event.get("attendance", {}).get(instance_date, {})
+        stats = {
+            "consolidations_count": len(date_data.get("consolidations", [])),
+            "new_people_count": len(date_data.get("new_people", [])),
+            "total_attendance": len(date_data.get("attendees", []))
+        }
 
         try:
             await log_activity(
@@ -15236,4 +15498,4 @@ async def preview_spreadsheet_columns(
         "column_mapping": column_mapping,
         "ignored_columns": [c["original"] for c in column_mapping if c["status"] == "ignored"],
         "sample_rows":    sample,
-    }  
+    }
