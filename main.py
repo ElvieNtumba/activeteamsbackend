@@ -2969,7 +2969,14 @@ async def get_other_events(
                         # Calculate financials if missing
                         price = att.get("price", 0)
                         paid = att.get("paid", att.get("paidAmount", 0))
-                        
+
+                        try:
+                            price = float(price) if price else 0
+                            paid = float(paid) if paid else 0
+                        except (TypeError, ValueError):
+                            price = 0
+                            paid = 0
+
                         if paid >= price:
                             owing = 0
                             change = paid - price
@@ -3199,7 +3206,14 @@ async def get_other_events(
                                 continue
                             price = att.get("price", 0)
                             paid = att.get("paid", att.get("paidAmount", 0))
-                            
+
+                            try:
+                                price = float(price) if price else 0
+                                paid = float(paid) if paid else 0
+                            except (TypeError, ValueError):
+                                price = 0
+                                paid = 0
+
                             if paid >= price:
                                 owing = 0
                                 change = paid - price
@@ -7360,7 +7374,14 @@ async def update_persistent_attendees(
             # Get price and paid amount
             event_price = attendee.get("price", 0)
             paid_amount = attendee.get("paidAmount", attendee.get("paid", 0))
-            
+
+            try:
+                event_price = float(event_price) if event_price else 0
+                paid_amount = float(paid_amount) if paid_amount else 0
+            except (TypeError, ValueError):
+                event_price = 0
+                paid_amount = 0
+
             # Calculate financials
             if paid_amount >= event_price:
                 owing = 0
