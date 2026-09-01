@@ -40,15 +40,8 @@ class Attendee(BaseModel):
     id: Optional[str] = None
     name: Optional[str] = None
     fullName: Optional[str] = None
-    surname: Optional[str] = None
-    gender: Optional[str] = None
-    birthday: Optional[str] = None
-    address: Optional[str] = None
-    stage: Optional[str] = None
-    leader1: Optional[str] = None
     leader12: Optional[str] = None
     leader144: Optional[str] = None
-    leader1728: Optional[str] = None
     time: Optional[datetime] = None
     email: Optional[str] = None
     phone: Optional[str] = None
@@ -76,15 +69,12 @@ class Attendee(BaseModel):
 
 # ===== IMPROVED AttendanceSubmission Model =====
 class AttendanceSubmission(BaseModel):
-    # Attendance rows are persisted as they happen.  The final submission only
-    # closes the instance, so clients no longer need to send the full roster.
-    attendees: List[Attendee] = Field(default_factory=list)
-    leaderEmail: str = ""
-    leaderName: str = ""
+    attendees: List[Attendee]
+    leaderEmail: str
+    leaderName: str
     did_not_meet: bool = False
     isTicketed: bool = False
     invitedBy: Optional[str] = None
-    headcount: int = 0
 
     @field_validator("attendees", mode="before")
     def validate_attendance(cls, v, info):
