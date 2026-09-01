@@ -8785,6 +8785,7 @@ async def get_all_people_for_event(
         
         cursor = people_collection.aggregate(pipeline)
         people_list = []
+        
         async for person in cursor:
             people_list.append(person)
         
@@ -10006,6 +10007,7 @@ async def get_user_tasks(
                 ]
             }
 
+        # Always include all tasks regardless of status
         cursor = tasks_collection.find(query).sort("followup_date", -1).limit(500)
         all_tasks = []
 
